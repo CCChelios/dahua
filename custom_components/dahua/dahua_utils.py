@@ -203,6 +203,33 @@ def parse_event(data: str) -> list[dict[str, any]]:
     return events
 
 
+def parse_snapshot_events(data: str) -> list[dict[str, str]]:
+    """Parse the text part returned by snapManager.attachFileProc.
+
+    Unlike eventManager, snapManager prefixes every field with Events[n].
+    Keep the output compatible with ``parse_event`` so both transports use the
+    same routing and entity update path.
+    """
+    events: dict[int, dict[str, str]] = {}
+    for match in re.finditer(r"^Events\[(\d+)\]\.([\w.]+)=(.*)$", data, re.MULTILINE):
+        event = events.setdefault(int(match.group(1)), {})
+        key, value = match.group(2), match.group(3).rstrip("\r")
+        if "." not in key:
+            event[key] = value
+        elif key.startswith("EventBaseInfo."):
+            event[key.removeprefix("EventBaseInfo.")] = value
+        elif key.endswith("Image.Length"):
+            event["_has_snapshot"] = value != "0"
+    for event in events.values():
+        if "Channel" in event and "index" not in event:
+            event["index"] = event["Channel"]
+        if "Index" in event and "index" not in event:
+            event["index"] = event["Index"]
+        if "Action" in event and "action" not in event:
+            event["action"] = event["Action"]
+    return [event for event in events.values() if "Code" in event]
+
+
 HOMOGLYPHS = {
     'Α': 'A', 'Β': 'B', 'Ε': 'E', 'Ζ': 'Z', 'Η': 'H', 'Ι': 'I',
     'Κ': 'K', 'Μ': 'M', 'Ν': 'N', 'Ο': 'O', 'Ρ': 'P', 'Τ': 'T',

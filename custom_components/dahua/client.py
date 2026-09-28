@@ -2593,8 +2593,7 @@ class DahuaClient:
                                                                                                 str(enabled).lower())
         return await self.get(url)
 
-
-    async def stream_events(self, on_receive, events: list, channel: int):
+    async def stream_events(self, on_receive, events: list, channel: int, on_image=None):
         """
         enable_motion_detection will either enable or disable motion detection on the camera depending on the supplied value
 
@@ -2653,8 +2652,12 @@ class DahuaClient:
             codes = "All"
         else:
             codes = ",".join(events)
-        url = "{0}/cgi-bin/eventManager.cgi?action=attach&codes=[{1}]&heartbeat={2}".format(
-            self._base, codes, EVENT_STREAM_HEARTBEAT_SECONDS)
+        if on_image is None:
+            url = "{0}/cgi-bin/eventManager.cgi?action=attach&codes=[{1}]&heartbeat={2}".format(
+                self._base, codes, EVENT_STREAM_HEARTBEAT_SECONDS)
+        else:
+            url = "{0}/cgi-bin/snapManager.cgi?action=attachFileProc&channel=1&Flags[0]=Event&Events=[{1}]&heartbeat={2}".format(
+                self._base, codes, EVENT_STREAM_HEARTBEAT_SECONDS)
         if self._username is None or self._password is None:
             # Returning quietly here spun a silent sixty second retry loop that
             # never did anything and never said so.
@@ -2716,7 +2719,11 @@ class DahuaClient:
                             if boundary not in buffer and len(buffer) > 131072:
                                 buffer = buffer[-4096:]
                             break
-                        on_receive(complete_part, channel)
+                        header, _, body = complete_part.partition(b"\r\n\r\n")
+                        if on_image is not None and b"Content-Type: image/jpeg" in header:
+                            on_image(body, channel)
+                        else:
+                            on_receive(complete_part, channel)
                 else:
                     on_receive(data, channel)
 

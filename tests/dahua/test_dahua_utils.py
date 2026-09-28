@@ -1,5 +1,6 @@
 from custom_components.dahua.dahua_utils import (
     parse_event,
+    parse_snapshot_events,
     extract_plate_data,
     normalize_plate,
     parse_authorized_plates,
@@ -130,6 +131,25 @@ class TestParseEvent:
 
         assert len(events) == 1
         assert events[0] == {"Code": "VideoMotion", "action": "Start", "index": "0"}
+
+
+def test_parse_snapshot_event_uses_channel_as_index():
+    """snapManager's field names are translated to the normal event shape."""
+    events = parse_snapshot_events(
+        "Events[0].EventBaseInfo.Code=FaceDetection\r\n"
+        "Events[0].Channel=3\r\n"
+        "Events[0].EventBaseInfo.Action=Start\r\n"
+        "Events[0].Data.FaceImage.Length=1234\r\n"
+    )
+
+    assert events == [{
+        "Code": "FaceDetection",
+        "Channel": "3",
+        "Action": "Start",
+        "index": "3",
+        "action": "Start",
+        "_has_snapshot": True,
+    }]
 
 
 class TestExtractPlateData:
@@ -321,5 +341,3 @@ class TestExtractPlateStringFallback:
         res = extract_plate_data(event)
         assert res is not None
         assert res["plate"] == "ABO1234"
-
-

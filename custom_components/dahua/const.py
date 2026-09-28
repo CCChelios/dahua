@@ -67,6 +67,7 @@ CONF_MANUAL_SECURITY_LIGHT = "manual_security_light"
 CONF_DISABLE_BACKCHANNEL = "disable_backchannel"
 CONF_AUTHORIZED_PLATES = "authorized_plates"
 CONF_AUTHORIZED_HOLD_TIME = "authorized_hold_time"
+CONF_EVENT_SNAPSHOTS = "event_snapshots"
 
 # Events
 EVENT_DAHUA_ANPR_RECOGNIZED = "dahua_anpr_recognized"

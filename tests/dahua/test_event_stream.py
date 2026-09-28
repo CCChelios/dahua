@@ -292,3 +292,25 @@ async def test_oversized_content_length_falls_back_to_next_boundary():
     assert len(got) == 2
     assert first_payload in got[0]
     assert second_payload in got[1]
+
+
+async def test_snapshot_stream_delivers_jpeg_to_image_handler():
+    """The image part is not decoded as an event text block."""
+    image = b"\xff\xd8jpeg\xff\xd9"
+    part = (
+        b"--myboundary\r\n"
+        b"Content-Type: image/jpeg\r\n"
+        b"Content-Length: " + str(len(image)).encode() + b"\r\n\r\n" + image
+    )
+    images = []
+    client = DahuaClient("u", "p", "d", 80, 554, _EndingSession(chunks=[part]))
+
+    with pytest.raises(EventStreamClosed):
+        await client.stream_events(
+            lambda data, channel: None,
+            ["FaceDetection"],
+            0,
+            lambda data, channel: images.append(data),
+        )
+
+    assert images == [image]

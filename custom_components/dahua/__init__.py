@@ -9,6 +9,7 @@ import random
 import re
 import ssl
 import time
+from pathlib import Path
 
 from datetime import timedelta
 
@@ -65,12 +66,13 @@ from .const import (
     CONF_AUTHORIZED_PLATES,
     DEFAULT_EVENTS,
     CONF_AUTHORIZED_HOLD_TIME,
+    CONF_EVENT_SNAPSHOTS,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_AUTHORIZED_HOLD_TIME,
     MIN_SCAN_INTERVAL,
     EVENT_DAHUA_ANPR_RECOGNIZED,
 )
-from .dahua_utils import parse_event
+from .dahua_utils import parse_event, parse_snapshot_events
 from .deterrence import (
     product_definition_supports_security_light,
     product_definition_supports_siren,
@@ -721,6 +723,10 @@ def get_configured_scan_interval(entry: ConfigEntry) -> timedelta:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up this integration using UI."""
+    # Dev containers identify as Docker and default local media to /media,
+    # which is often root-owned. Keep Dahua event images in HA's config media
+    # directory and make that directory visible through the Local Media source.
+    hass.config.media_dirs["local"] = hass.config.path("media")
     if hass.data.get(DOMAIN) is None:
         hass.data.setdefault(DOMAIN, {})
         _LOGGER.info(STARTUP_MESSAGE)
@@ -1228,6 +1234,7 @@ class DahuaHostEventStream:
         self._owner = None  # whose client the stream currently borrows
         self._events: frozenset = frozenset()
         self._task: asyncio.Task | None = None
+        self._snapshot_task: asyncio.Task | None = None
         # Whether the last attach failed, so an outage is reported once.
         self._failing = False
         # How many times running the stream has died on contact, which is what
@@ -1236,6 +1243,8 @@ class DahuaHostEventStream:
         # Whether the device sent anything on the current attach. Reset per
         # attempt, so it describes this stream and not the one before it.
         self._received_data = False
+        self._event_snapshots = False
+        self._snapshot_events: deque[dict] = deque()
 
     @property
     def coordinators(self) -> list:
@@ -1251,6 +1260,13 @@ class DahuaHostEventStream:
         for coordinator in self.coordinators:
             union.update(coordinator.events or [])
         return frozenset(union)
+
+    def _wants_event_snapshots(self) -> bool:
+        """Whether any configured channel asks this shared stream for JPEGs."""
+        return any(
+            coordinator.config_entry.options.get(CONF_EVENT_SNAPSHOTS, False)
+            for coordinator in self.coordinators
+        )
 
     def register(self, coordinator) -> None:
         self._by_channel.setdefault(coordinator.get_channel(), []).append(coordinator)
@@ -1281,22 +1297,43 @@ class DahuaHostEventStream:
 
     def _restart_if_needed(self) -> None:
         wanted = self._union()
-        if self._task is not None and not self._task.done() and wanted == self._events:
+        snapshots = self._wants_event_snapshots()
+        previous_snapshots = self._event_snapshots
+        event_stream_running = self._task is not None and not self._task.done()
+        if event_stream_running and wanted == self._events:
+            pass
+        else:
+            self._events = wanted
+            if self._task is not None:
+                self._task.cancel()
+                self._task = None
+            if wanted and self._owner is not None:
+                self._task = asyncio.create_task(self._async_run())
+
+        if snapshots == previous_snapshots and (
+                (snapshots and self._snapshot_task is not None)
+                or (not snapshots and self._snapshot_task is None)):
             return
         self._events = wanted
-        if self._task is not None:
-            self._task.cancel()
-            self._task = None
-        if wanted and self._owner is not None:
-            self._task = asyncio.create_task(self._async_run())
+        self._event_snapshots = snapshots
+        if self._snapshot_task is not None:
+            self._snapshot_task.cancel()
+            self._snapshot_task = None
+        if snapshots and wanted and self._owner is not None:
+            _LOGGER.debug("Starting event snapshot stream for %s on channel 1", self._address)
+            self._snapshot_task = asyncio.create_task(self._async_run_snapshots())
 
     async def async_stop(self) -> None:
         if self._task is not None:
             self._task.cancel()
             self._task = None
+        if self._snapshot_task is not None:
+            self._snapshot_task.cancel()
+            self._snapshot_task = None
         self._by_channel.clear()
         self._owner = None
         self._events = frozenset()
+        self._snapshot_events.clear()
 
     async def _async_run(self) -> None:
         """Hold the stream open, recycling it the way a single channel used to."""
@@ -1306,7 +1343,7 @@ class DahuaHostEventStream:
             try:
                 await asyncio.wait_for(
                     self._owner.client.stream_events(
-                        self.on_receive, sorted(self._events), 0
+                        self.on_receive, sorted(self._events), 0,
                     ),
                     timeout=jittered(EVENT_STREAM_MAX_LIFETIME_SECONDS),
                 )
@@ -1397,6 +1434,36 @@ class DahuaHostEventStream:
             else:
                 _LOGGER.debug("Reconnecting to event stream for %s", self._address)
 
+    async def _async_run_snapshots(self) -> None:
+        """Receive JPEGs without replacing the authoritative event stream."""
+        while True:
+            try:
+                _LOGGER.debug("Attaching event snapshot stream for %s", self._address)
+                await self._owner.client.stream_events(
+                    self.on_snapshot_metadata,
+                    sorted(self._events),
+                    0,
+                    self.on_image,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # pylint: disable=broad-except
+                _LOGGER.debug("Event snapshot stream for %s ended: %s", self._address, ex)
+                await asyncio.sleep(EVENT_STREAM_RETRY_SECONDS)
+
+    def on_snapshot_metadata(self, data_bytes: bytes, _channel: int) -> None:
+        """Queue snapManager metadata solely to associate its following JPEG."""
+        self._received_data = True
+        events = parse_snapshot_events(data_bytes.decode("utf-8", errors="ignore"))
+        # This recorder sends the JPEG as the next multipart part but omits
+        # the optional Data.*Image.Length fields from its metadata.
+        snapshots = events
+        _LOGGER.debug(
+            "Event snapshot metadata from %s: %d events, %d queued for JPEG",
+            self._address, len(events), len(snapshots),
+        )
+        self._snapshot_events.extend(snapshots)
+
     def on_receive(self, data_bytes: bytes, _channel: int) -> None:
         """Parse once, then hand each event only to the channels that want it."""
         # Before the parse, deliberately: a heartbeat carries no event but is
@@ -1406,8 +1473,15 @@ class DahuaHostEventStream:
         self._received_data = True
 
         events = parse_event(data_bytes.decode("utf-8", errors="ignore"))
+        if not events and self._event_snapshots:
+            events = parse_snapshot_events(data_bytes.decode("utf-8", errors="ignore"))
         if not events:
             return
+
+        if self._event_snapshots:
+            self._snapshot_events.extend(
+                event for event in events if event.pop("_has_snapshot", False)
+            )
 
         for event in events:
             index = 0
@@ -1476,6 +1550,30 @@ class DahuaHostEventStream:
                         event.get("Code", "?"), self._address, index, exc_info=True,
                     )
 
+    @callback
+    def on_image(self, image: bytes, _channel: int) -> None:
+        """Persist the next snapshot part under the camera that produced it."""
+        if not image or not self._snapshot_events:
+            _LOGGER.debug(
+                "Discarding unassociated event image from %s (%d bytes)",
+                self._address, len(image),
+            )
+            return
+        event = self._snapshot_events.popleft()
+        try:
+            index = int(event.get("index", 0))
+        except ValueError:
+            index = 0
+        coordinators = self._by_channel.get(index, ())
+        if not coordinators:
+            return
+        for coordinator in coordinators:
+            if not coordinator.config_entry.options.get(CONF_EVENT_SNAPSHOTS, False):
+                continue
+            self._hass.async_create_task(
+                coordinator.async_save_event_snapshot(image, event)
+            )
+
 
 # address -> DahuaHostEventStream
 _HOST_STREAMS: Dict[str, DahuaHostEventStream] = {}
@@ -1487,6 +1585,12 @@ def _host_stream(hass: HomeAssistant, address: str) -> DahuaHostEventStream:
     if stream is None:
         stream = _HOST_STREAMS[address] = DahuaHostEventStream(hass, address)
     return stream
+
+
+def _write_event_snapshot(path: Path, image: bytes) -> None:
+    """Write an event image outside Home Assistant's event loop."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(image)
 
 
 async def _release_host_stream(coordinator) -> None:
@@ -1680,6 +1784,25 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             self._vto_task.cancel()
             self._vto_task = None
         await self._close_session()
+
+    async def async_save_event_snapshot(self, image: bytes, event: dict) -> None:
+        """Store a Dahua event JPEG in Home Assistant's local media folder."""
+        if not image.startswith(b"\xff\xd8"):
+            _LOGGER.warning("Discarding a non-JPEG event snapshot from %s", self._address)
+            return
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", self.get_device_name()).strip("._")
+        camera_dir = "{}_{}".format(self.get_channel(), safe_name or "camera")
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        code = re.sub(r"[^A-Za-z0-9._-]+", "_", event.get("Code", "event"))
+        filename = "{}_{}_{}.jpg".format(
+            time.strftime("%H%M%S", time.localtime()), code, time.time_ns()
+        )
+        path = Path(self.hass.config.media_dirs["local"]) / "dahua" / camera_dir / day / filename
+        try:
+            await self.hass.async_add_executor_job(_write_event_snapshot, path, image)
+            _LOGGER.debug("Saved Dahua event snapshot to %s", path)
+        except OSError:
+            _LOGGER.warning("Could not save event snapshot to %s", path, exc_info=True)
 
     async def _close_session(self) -> None:
         _LOGGER.debug("Closing Session")
@@ -3892,4 +4015,3 @@ def _async_report_removal(hass: HomeAssistant, entry: ConfigEntry, address: str,
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload config entry."""
     await hass.config_entries.async_reload(entry.entry_id)
-

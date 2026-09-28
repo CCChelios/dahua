@@ -48,6 +48,7 @@ from .const import (
     CONF_DISABLE_BACKCHANNEL,
     CONF_AUTHORIZED_PLATES,
     CONF_AUTHORIZED_HOLD_TIME,
+    CONF_EVENT_SNAPSHOTS,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_AUTHORIZED_HOLD_TIME,
     MIN_SCAN_INTERVAL,
@@ -1305,6 +1306,12 @@ class DahuaOptionsFlowHandler(config_entries.OptionsFlow):
             vol.Required(
                 CONF_DISABLE_BACKCHANNEL,
                 default=self.options.get(CONF_DISABLE_BACKCHANNEL, False),
+            )
+        ] = bool
+        schema[
+            vol.Required(
+                CONF_EVENT_SNAPSHOTS,
+                default=self.options.get(CONF_EVENT_SNAPSHOTS, False),
             )
         ] = bool
         schema[
