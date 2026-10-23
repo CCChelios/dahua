@@ -4,13 +4,16 @@ None of the behavioural tests can see that, because creating an issue does not
 resolve its text. These are plain file assertions.
 """
 
+import ast
 import json
 import re
 from pathlib import Path
 
 import pytest
 
-TRANSLATIONS = Path(__file__).resolve().parents[2] / "custom_components" / "dahua" / "translations"
+TRANSLATIONS = (
+    Path(__file__).resolve().parents[2] / "custom_components" / "dahua" / "translations"
+)
 EN = json.loads((TRANSLATIONS / "en.json").read_text(encoding="utf-8"))
 
 # What the code actually passes to async_create_issue / async_show_form.
@@ -23,14 +26,79 @@ ISSUE_PLACEHOLDERS = {
     "siblings_remain": {"address", "count"},
     "removal_broke_things": {"removed", "dependents", "names"},
     "channel_not_added": {"address", "channel", "reason"},
+    "webrtc_cannot_play": {"address", "channels", "count"},
+    "motion_not_pushed": {"address", "channels"},
 }
 FIX_FLOW_PLACEHOLDERS = {"address", "entries", "port"}
-SIBLINGS_FLOW_PLACEHOLDERS = {"address", "count", "titles", "removed",
-                              "dependents_note"}
+
+PACKAGE = TRANSLATIONS.parent
+
+
+def _form_placeholders(class_name: str) -> set:
+    """The keys a repair flow's own `async_show_form` supplies.
+
+    Read from `repairs.py` rather than listed here. This was a hand-written set
+    and it went stale the moment the form gained a placeholder: the string and
+    the code agreed, and the test disagreed with both. A literal list of what
+    another file does is a second source of truth, and the whole point of this
+    file is that there should be one.
+    """
+    tree = ast.parse((PACKAGE / "repairs.py").read_text(encoding="utf-8"))
+    flow = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    for node in ast.walk(flow):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "description_placeholders":
+                continue
+            return {
+                key.value
+                for key in keyword.value.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+    raise AssertionError(
+        "%s no longer passes description_placeholders to async_show_form. If the "
+        "form moved, point this at the new place: without it every placeholder "
+        "check below passes vacuously." % class_name
+    )
+
+
+SIBLINGS_FLOW_PLACEHOLDERS = _form_placeholders("RemoveSiblingsRepairFlow")
 
 
 def _placeholders(text: str) -> set:
     return set(re.findall(r"\{(\w+)\}", text))
+
+
+# An issue key is one handed to `async_create_issue`. Read from the call rather
+# than matched in the text: this was a regex with a lookbehind to keep an entity's
+# `_attr_translation_key` out, which worked until `HomeAssistantError` learnt
+# translation keys and four exception messages were reported as issues the code
+# raises with no strings for them. A pattern cannot tell those apart. The callee
+# can.
+ISSUE_RAISER = "async_create_issue"
+
+
+def issue_keys_in(source: str) -> set:
+    """Literal translation keys passed to async_create_issue in one module."""
+    keys = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name != ISSUE_RAISER:
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "translation_key" and isinstance(
+                keyword.value, ast.Constant
+            ):
+                keys.add(keyword.value.value)
+    return keys
 
 
 def test_the_map_above_covers_every_issue_the_code_raises():
@@ -41,16 +109,47 @@ def test_the_map_above_covers_every_issue_the_code_raises():
     channel_not_added left it untested here and every test in this file still passed.
     Deriving the set from the source makes the drift impossible instead.
     """
-    source = ""
-    for name in ("config_flow.py", "__init__.py", "repairs.py"):
-        source += (TRANSLATIONS.parent / name).read_text(encoding="utf-8")
+    # Every module, not the three that happened to raise an issue when this was
+    # written. Two of them moved to host.py and this reported them as being in the
+    # map but not the code, which is exactly backwards.
+    from .integration_source import modules
 
-    raised = set(re.findall(r'translation_key="([a-z_]+)"', source))
+    raised = set()
+    for text in modules().values():
+        raised |= issue_keys_in(text)
 
-    assert raised == set(ISSUE_PLACEHOLDERS), (
-        "in the code but not the map: %s; in the map but not the code: %s"
-        % (sorted(raised - set(ISSUE_PLACEHOLDERS)),
-           sorted(set(ISSUE_PLACEHOLDERS) - raised)))
+    assert raised == set(
+        ISSUE_PLACEHOLDERS
+    ), "in the code but not the map: %s; in the map but not the code: %s" % (
+        sorted(raised - set(ISSUE_PLACEHOLDERS)),
+        sorted(set(ISSUE_PLACEHOLDERS) - raised),
+    )
+
+
+def test_only_a_created_issue_counts_as_an_issue():
+    """Three unrelated things pass `translation_key=` and they read identically.
+
+    An entity is handed the key the platform chose, a HomeAssistantError names a
+    message, and only `async_create_issue` raises a repair. The regex this replaced
+    could not tell them apart, and the day HomeAssistantError learnt translation
+    keys it reported four exception messages as issues with no strings. So the
+    control is all three kinds at once.
+    """
+    sample = (
+        'ir.async_create_issue(hass, DOMAIN, key, translation_key="device_unreachable")\n'
+        "raise HomeAssistantError(translation_domain=DOMAIN,\n"
+        '                         translation_key="cancel_call_refused")\n'
+        'DahuaSirenBinarySwitch(c, e, translation_key="siren")\n'
+        '_attr_translation_key = "firmware_version"\n'
+    )
+
+    assert issue_keys_in(sample) == {"device_unreachable"}
+    # And the sample really does carry the other three kinds, or this proves
+    # nothing. Named rather than counted: the first version of this line asserted
+    # a count I worked out by hand, and got it wrong.
+    for confusable in ("cancel_call_refused", "siren", "firmware_version"):
+        assert confusable in sample
+        assert confusable not in issue_keys_in(sample)
 
 
 @pytest.mark.parametrize("key", sorted(ISSUE_PLACEHOLDERS))
@@ -91,7 +190,15 @@ def test_no_text_uses_a_placeholder_the_code_does_not_supply(key):
     """An unsupplied placeholder renders literally as {whatever}."""
     issue = EN["issues"][key]
     used = _placeholders(issue["title"]) | _placeholders(issue.get("description", ""))
-    assert used <= ISSUE_PLACEHOLDERS[key], f"unsupplied: {used - ISSUE_PLACEHOLDERS[key]}"
+    assert (
+        used <= ISSUE_PLACEHOLDERS[key]
+    ), f"unsupplied: {used - ISSUE_PLACEHOLDERS[key]}"
+
+
+def test_the_placeholders_were_really_read_from_the_code():
+    """A derivation that quietly returned nothing would make the next test pass
+    whatever the string said."""
+    assert {"address", "count", "titles", "removed"} <= SIBLINGS_FLOW_PLACEHOLDERS
 
 
 def test_the_siblings_flow_only_uses_its_own_placeholders():
@@ -99,8 +206,9 @@ def test_the_siblings_flow_only_uses_its_own_placeholders():
     async_show_form did not supply, so it would have rendered literally."""
     step = EN["issues"]["siblings_remain"]["fix_flow"]["step"]["confirm"]
     used = _placeholders(step["title"]) | _placeholders(step["description"])
-    assert used <= SIBLINGS_FLOW_PLACEHOLDERS, (
-        f"unsupplied: {used - SIBLINGS_FLOW_PLACEHOLDERS}")
+    assert (
+        used <= SIBLINGS_FLOW_PLACEHOLDERS
+    ), f"unsupplied: {used - SIBLINGS_FLOW_PLACEHOLDERS}"
 
 
 def test_the_siblings_issue_is_fixable_and_the_notice_is_not():

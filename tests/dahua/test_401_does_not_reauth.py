@@ -31,11 +31,19 @@ def _client(status):
     async def get(url, verify_ok=False):
         raise aiohttp.ClientResponseError(None, None, status=status, message="x")
 
+    async def no_rpc2(call):
+        # This device speaks no RPC2 either, so the VTH identity path finds
+        # nothing and the fallback under test is what answers. Without it the
+        # 404 and 501 cases reach for a real socket, which the suite blocks.
+        raise ConnectionError("no RPC2 here")
+
     c.get = get
+    c._rpc2_shared_call = no_rpc2
     return c
 
 
 # --- the coordinator's path: a 401 must not be fatal ------------------------
+
 
 async def test_a_401_falls_back_by_default():
     """What the coordinator calls, and what 0.10.7 did."""
@@ -58,6 +66,7 @@ async def test_no_status_is_fatal_by_default(status):
 
 
 # --- the config flow's path: a 401 is exactly what it is testing for --------
+
 
 async def test_a_401_is_raised_when_the_caller_asked():
     """#702: a wrong password must fail setup, not add a broken camera."""

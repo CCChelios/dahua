@@ -1,7 +1,9 @@
 """light.py had no tests at all, and day/night handling has regressed before."""
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
+import aiohttp
 import pytest
 
 from custom_components.dahua import dahua_utils
@@ -13,12 +15,31 @@ ATTR_BRIGHTNESS = "brightness"
 class _Client:
     def __init__(self):
         self.v1 = []
+        # Which brightness bank each write named. Hardcoded MiddleLight until a
+        # recorder turned up whose channel has only NearLight and FarLight.
+        self.v1_banks = []
         self.v2 = []
         self.v2_raw = []
         self.scheme_calls = []
         self.scheme_reads = 0
         self.scheme_writes = []
         self.operations = []
+        # (channel, enabled, brightness) for each channel-scoped force (#959).
+        self.channel_scoped_calls = []
+
+        # How the device answers an infrared write: normally it takes it. Set
+        # v1_refuses to an exception to model a refusal, or v1_ignores to model
+        # the 200 that changes nothing.
+        self.v1_refuses = None
+        self.v1_ignores = False
+        # The Lighting_V2 path, which infrared reaches only after v1 refuses.
+        self.v2_modes = []
+        self.v2_refuses = None
+        # When set to an exception, the CGI setConfig path async_set_lighting_v2
+        # raises it (a 400 models a Lighting_V2 table that is read-only over CGI).
+        self.v2_set_refuses = None
+        self.v2_ignores = False
+        self.infrared_mode = "Auto"
 
         # Default camera state used by the existing illuminator tests.
         self.scheme = "AIMode"
@@ -26,8 +47,45 @@ class _Client:
         self.light_brightness = 64
         self.light_field = "NearLight"
 
-    async def async_set_lighting_v1(self, channel, enabled, brightness, profile_mode="0"):
-        self.v1.append((channel, enabled, brightness, profile_mode))
+    async def async_force_channel_scoped_white_light(
+        self, channel, enabled, brightness
+    ):
+        """The #959 recorder-channel path. Records the routed arguments."""
+        self.channel_scoped_calls.append((channel, enabled, brightness))
+
+    async def async_set_lighting_v2_mode(
+        self, channel, mode, brightness, profile_mode, light_index=0, bank="MiddleLight"
+    ):
+        """The fallback path infrared takes once v1 has been refused."""
+        self.v2_modes.append(
+            (channel, mode, brightness, profile_mode, light_index, bank)
+        )
+        if self.v2_refuses is not None:
+            raise self.v2_refuses
+        if not self.v2_ignores:
+            self.infrared_mode = mode
+
+    async def async_set_lighting_v1_mode(
+        self, channel, mode, brightness, profile_mode="0", bank="MiddleLight"
+    ):
+        self.v1.append((channel, mode, brightness, profile_mode))
+        self.v1_banks.append(bank)
+        if self.v1_refuses is not None:
+            raise self.v1_refuses
+        # A device that takes the write reports the new mode on the next poll.
+        # A recorder that accepts the request for a remote camera and never
+        # passes it on answers 200 and keeps reporting the old one, which is the
+        # case v1_ignores models.
+        if not self.v1_ignores:
+            self.infrared_mode = mode
+
+    async def async_set_lighting_v1(
+        self, channel, enabled, brightness, profile_mode="0", bank="MiddleLight"
+    ):
+        """What the real client does with it: on is Manual, off is Off."""
+        await self.async_set_lighting_v1_mode(
+            channel, "Manual" if enabled else "Off", brightness, profile_mode, bank
+        )
 
     async def async_get_lighting_scheme_mode(self, channel, profile_mode):
         return self.scheme
@@ -46,12 +104,8 @@ class _Client:
     async def async_set_lighting_scheme(self, channel, profile_mode, mode):
         previous = self.scheme
         self.scheme = mode
-        self.scheme_writes.append(
-            (channel, profile_mode, mode)
-        )
-        self.operations.append(
-            ("scheme", channel, profile_mode, mode)
-        )
+        self.scheme_writes.append((channel, profile_mode, mode))
+        self.operations.append(("scheme", channel, profile_mode, mode))
         return previous
 
     async def async_get_lighting_v2_live_state(
@@ -75,6 +129,8 @@ class _Client:
         light_index=0,
         bank="MiddleLight",
     ):
+        if self.v2_set_refuses is not None:
+            raise self.v2_set_refuses
         self.v2.append(
             (
                 channel,
@@ -163,13 +219,26 @@ class _Store:
 
 
 class _Coordinator:
-    def __init__(self, channel=3, profile_mode="1", uses_scheme=False):
+    def __init__(
+        self, channel=3, profile_mode="1", uses_scheme=False, uses_channel_scoped=False
+    ):
         self.client = _Client()
         self._channel = channel
         self._profile_mode = profile_mode
         self.refreshed = 0
         self.infrared_on = True
         self.infrared_brightness = 128
+        # CoordinatorEntity.available reads this, and DahuaBaseEntity does
+        # not override available -- only DahuaEventDrivenEntity does -- so
+        # the mode select's super().available is Home Assistant's own.
+        self.last_update_success = True
+        # DahuaBaseEntity.extra_state_attributes reads data.get("id"), and
+        # the infrared light adds to that dict rather than replacing it.
+        self.data = {"id": "7"}
+        self.infrared_level = 50
+        self.infrared_bank = "MiddleLight"
+        # None means the v1 Lighting path, which is what these tests assume.
+        self.infrared_v2_row = None
         self.illuminator_on = False
         self.illuminator_brightness = 64
         # Which light this device calls the white one; 0 on most models.
@@ -178,6 +247,7 @@ class _Coordinator:
         self.illuminator_bank = "MiddleLight"
         self.camera_reboot_generation = 0
         self.uses_scheme = uses_scheme
+        self.uses_channel_scoped = uses_channel_scoped
 
     def get_channel(self):
         return self._channel
@@ -195,11 +265,50 @@ class _Coordinator:
     def get_device_name(self):
         return "Front Door"
 
+    def get_address(self):
+        """Read by CoordinatorEntity.available, which the mode select builds on."""
+        return "192.168.0.213"
+
     def is_infrared_light_on(self):
         return self.infrared_on
 
+    def get_infrared_mode(self):
+        """What the device reports now, which is how a write is checked."""
+        return self.client.infrared_mode
+
     def get_infrared_brightness(self):
         return self.infrared_brightness
+
+    def get_infrared_level(self):
+        """The device's own 0..100 scale, which is readable whatever the mode."""
+        return self.infrared_level
+
+    def get_infrared_bank(self):
+        """Which brightness bank this channel's emitter uses."""
+        return self.infrared_bank
+
+    def get_infrared_v2_row(self):
+        """(profile, index, bank) when this channel drives infrared through
+        Lighting_V2, else None. None keeps the v1 path these tests were written
+        against; test_driving_infrared_through_lighting_v2.py covers the other."""
+        return self.infrared_v2_row
+
+    def infrared_reads_lighting_v2(self):
+        """Whether the mode is read from Lighting_V2, which is wherever a row
+        exists. Weaker than the test the *write* uses, deliberately: see
+        test_the_v1_lighting_table_can_be_a_decoy.py."""
+        return self.get_infrared_v2_row() is not None
+
+    def lighting_v2_samples(self):
+        """How many real Lighting_V2 readings the poll has taken.
+
+        Modelled on `refreshed`, so every refresh here counts as one: this
+        double's device always answers. A device whose read fails carries the
+        previous table forward and does *not* count, which is the case
+        test_the_v1_lighting_table_can_be_a_decoy.py covers against the real
+        coordinator rather than here.
+        """
+        return self.refreshed
 
     def is_illuminator_on(self):
         return self.illuminator_on
@@ -219,29 +328,35 @@ class _Coordinator:
     def uses_lighting_scheme_illuminator(self):
         return self.uses_scheme
 
+    def uses_channel_scoped_illuminator(self):
+        return self.uses_channel_scoped
+
     async def async_refresh(self):
         self.refreshed += 1
 
 
-def _light(cls, coordinator, name="Infrared"):
-    """Build the entity without Home Assistant's entity plumbing."""
+def _light(cls, coordinator):
+    """Build the entity without Home Assistant's entity plumbing.
+
+    It used to take a display name and set `_name`. These entities name
+    themselves through translations/en.json now, so nothing reads that and the
+    argument was doing nothing at 23 call sites.
+    """
     entity = object.__new__(cls)
     entity._coordinator = coordinator
     entity.coordinator = coordinator
-    entity._name = name
     # These unit tests bypass entity registration; observe state writes without
     # asking Home Assistant to publish an unregistered entity.
     entity.async_write_ha_state = Mock()
 
     if cls is DahuaIlluminator:
         entity._manual_on = False
+        entity._scheme_fallback = False
         entity._scheme_restore = None
         entity._light_restore = None
         entity._last_brightness = 255
         entity._restore_store = _Store()
-        entity._seen_reboot_generation = (
-            coordinator.get_camera_reboot_generation()
-        )
+        entity._seen_reboot_generation = coordinator.get_camera_reboot_generation()
         entity._reboot_recovery_task = None
 
     return entity
@@ -249,23 +364,30 @@ def _light(cls, coordinator, name="Infrared"):
 
 # --- brightness conversion -------------------------------------------------
 
-@pytest.mark.parametrize("hass_value,expected", [
-    (0, 0),
-    (255, 100),
-    (128, 50),
-    (None, 100),   # no brightness given means full, not off
-])
+
+@pytest.mark.parametrize(
+    "hass_value,expected",
+    [
+        (0, 0),
+        (255, 100),
+        (128, 50),
+        (None, 100),  # no brightness given means full, not off
+    ],
+)
 def test_hass_brightness_maps_to_dahua_scale(hass_value, expected):
     assert dahua_utils.hass_brightness_to_dahua_brightness(hass_value) == expected
 
 
-@pytest.mark.parametrize("dahua_value,expected", [
-    ("0", 0),
-    ("100", 255),
-    ("50", 127),
-    ("", 255),     # blank means full
-    (None, 255),
-])
+@pytest.mark.parametrize(
+    "dahua_value,expected",
+    [
+        ("0", 0),
+        ("100", 255),
+        ("50", 127),
+        ("", 255),  # blank means full
+        (None, 255),
+    ],
+)
 def test_dahua_brightness_maps_back_to_hass_scale(dahua_value, expected):
     assert dahua_utils.dahua_brightness_to_hass_brightness(dahua_value) == expected
 
@@ -282,7 +404,10 @@ def test_the_two_conversions_agree_on_what_no_value_means():
 
     assert no_value_hass == 255, "full on the HASS scale"
     assert no_value_dahua == 100, "full on the Dahua scale"
-    assert dahua_utils.dahua_brightness_to_hass_brightness(str(no_value_dahua)) == no_value_hass
+    assert (
+        dahua_utils.dahua_brightness_to_hass_brightness(str(no_value_dahua))
+        == no_value_hass
+    )
 
 
 def test_full_and_off_survive_a_round_trip():
@@ -293,12 +418,14 @@ def test_full_and_off_survive_a_round_trip():
 
 # --- infrared light (v1 API) ----------------------------------------------
 
+
 async def test_infrared_turn_on_sends_the_channel_and_brightness():
     c = _Coordinator(channel=3)
     await _light(DahuaInfraredLight, c).async_turn_on(**{ATTR_BRIGHTNESS: 255})
 
-    assert c.client.v1 == [(3, True, 100, "1")], (
-        "the write must name the profile the camera is using, not 0")
+    assert c.client.v1 == [
+        (3, "Manual", 100, "1")
+    ], "the write must name the profile the camera is using, not 0"
     assert c.client.v2 == [], "the infrared light must not use the v2 API"
     assert c.refreshed == 1
 
@@ -308,8 +435,8 @@ async def test_infrared_turn_off_sends_enabled_false():
     await _light(DahuaInfraredLight, c).async_turn_off()
 
     assert len(c.client.v1) == 1
-    channel, enabled, _, profile = c.client.v1[0]
-    assert (channel, enabled) == (3, False)
+    channel, mode, _, profile = c.client.v1[0]
+    assert (channel, mode) == (3, "Off")
     assert profile == "1", "turning off must reach the same profile as turning on"
 
 
@@ -332,21 +459,20 @@ def test_infrared_reads_state_from_the_coordinator():
 
 # --- illuminator (v2 API, carries the profile mode) ------------------------
 
+
 async def test_illuminator_passes_the_profile_mode_through():
     """Day/night handling rides on this argument and has regressed before."""
     c = _Coordinator(channel=2, profile_mode="1")
 
-    await _light(DahuaIlluminator, c, "Illuminator").async_turn_on(**{ATTR_BRIGHTNESS: 255})
+    await _light(DahuaIlluminator, c).async_turn_on(**{ATTR_BRIGHTNESS: 255})
 
-    assert c.client.v2 == [
-        (2, True, 100, "1", 0, "NearLight")
-    ]
+    assert c.client.v2 == [(2, True, 100, "1", 0, "NearLight")]
     assert c.client.v1 == [], "the illuminator must not use the v1 API"
 
 
 async def test_illuminator_turn_off_keeps_the_profile_mode():
     c = _Coordinator(channel=2, profile_mode="0")
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
     await light.async_turn_on()
     c._profile_mode = "1"
     await light.async_turn_off()
@@ -366,14 +492,14 @@ async def test_illuminator_writes_to_the_light_the_device_calls_white():
     c = _Coordinator(channel=2, profile_mode="0")
     c.illuminator_index = 1
 
-    await _light(DahuaIlluminator, c, "Illuminator").async_turn_on()
+    await _light(DahuaIlluminator, c).async_turn_on()
 
     assert c.client.v2[0][4] == 1, "the illuminator wrote to the wrong light"
 
 
 async def test_illuminator_uses_whatever_profile_mode_is_current():
     c = _Coordinator(profile_mode="2")
-    await _light(DahuaIlluminator, c, "Illuminator").async_turn_on()
+    await _light(DahuaIlluminator, c).async_turn_on()
     assert c.client.v2[0][3] == "2"
 
 
@@ -381,24 +507,121 @@ async def test_scheme_illuminator_uses_the_two_table_client_path():
     c = _Coordinator(channel=0, profile_mode="1", uses_scheme=True)
     c.illuminator_index = 1
 
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
+    assert light.is_on is False
+
     await light.async_turn_on(**{ATTR_BRIGHTNESS: 255})
+    assert light.is_on is True
+
     await light.async_turn_off(**{ATTR_BRIGHTNESS: 255})
+    assert light.is_on is False
 
     assert c.client.scheme_calls == [
         (0, True, 100, "1", 1),
         (0, False, 100, "1", 1),
     ]
     assert c.client.v2 == []
+    assert light.async_write_ha_state.call_count == 2
+
+
+async def test_channel_scoped_illuminator_routes_to_the_force_method():
+    """A recorder channel whose LightingScheme answers per channel (#959) goes to
+    the channel-scoped force method, not the plain Lighting_V2 path, and passes the
+    channel, the on/off, and the converted brightness (255 -> 100). OFF brightness
+    is unused by the override, so it is sent as 0."""
+    c = _Coordinator(channel=11, profile_mode="1", uses_channel_scoped=True)
+
+    light = _light(DahuaIlluminator, c)
+    assert light.is_on is False
+
+    await light.async_turn_on(**{ATTR_BRIGHTNESS: 255})
+    assert light.is_on is True
+
+    await light.async_turn_off()
+    assert light.is_on is False
+
+    assert c.client.channel_scoped_calls == [(11, True, 100), (11, False, 0)]
+    assert c.client.v2 == [] and c.client.v2_raw == [] and c.client.v1 == []
+    assert c.client.scheme_calls == []
+    assert light.async_write_ha_state.call_count == 2
+
+
+def _cgi_400():
+    return aiohttp.ClientResponseError(
+        SimpleNamespace(real_url="http://10.0.0.5/cgi-bin/configManager.cgi"),
+        (),
+        status=400,
+    )
+
+
+async def test_lighting_v2_400_falls_back_to_the_scheme_path():
+    """A camera whose Lighting_V2 is CGI read-only returns 400 to the plain
+    write. The illuminator must then drive the white light through the two-table
+    LightingScheme path instead, and turn on (#994)."""
+    c = _Coordinator(channel=0, profile_mode="1")  # not scheme, not channel-scoped
+    c.illuminator_index = 1
+    c.client.v2_set_refuses = _cgi_400()
+
+    light = _light(DahuaIlluminator, c)
+    await light.async_turn_on(**{ATTR_BRIGHTNESS: 255})
+
+    assert light._scheme_fallback is True
+    assert light.is_on is True
+    # The two-table path ran with the on command; the dead CGI write recorded
+    # nothing because it was refused before appending.
+    assert c.client.scheme_calls == [(0, True, 100, "1", 1)]
+    assert c.client.v2 == []
+
+
+async def test_a_learned_scheme_fallback_skips_the_cgi_path():
+    """Once learned, both on and off go straight to the two-table path and never
+    touch the refused CGI write again."""
+    c = _Coordinator(channel=0, profile_mode="1")
+    c.illuminator_index = 1
+    c.client.v2_set_refuses = _cgi_400()  # would raise if the CGI path were used
+
+    light = _light(DahuaIlluminator, c)
+    light._scheme_fallback = True
+
+    await light.async_turn_on(**{ATTR_BRIGHTNESS: 255})
+    await light.async_turn_off()
+
+    assert [call[:2] for call in c.client.scheme_calls] == [(0, True), (0, False)]
+    assert c.client.v2 == []
+    assert light.is_on is False
+
+
+async def test_scheme_illuminator_failed_write_preserves_entity_state(monkeypatch):
+    c = _Coordinator(uses_scheme=True)
+    light = _light(DahuaIlluminator, c)
+
+    async def fail_write(*_args):
+        raise RuntimeError("camera rejected write")
+
+    monkeypatch.setattr(
+        c.client,
+        "async_set_lighting_scheme_illuminator",
+        fail_write,
+    )
+
+    with pytest.raises(RuntimeError, match="camera rejected write"):
+        await light.async_turn_on()
+    assert light.is_on is False
+
+    light._manual_on = True
+    with pytest.raises(RuntimeError, match="camera rejected write"):
+        await light.async_turn_off()
+    assert light.is_on is True
 
 
 # --- identity --------------------------------------------------------------
+
 
 def test_the_two_lights_do_not_share_a_unique_id():
     """A collision would merge two different lights into one entity."""
     c = _Coordinator()
     infrared = _light(DahuaInfraredLight, c).unique_id
-    illuminator = _light(DahuaIlluminator, c, "Illuminator").unique_id
+    illuminator = _light(DahuaIlluminator, c).unique_id
 
     assert infrared == "SERIAL1_infrared"
     assert illuminator == "SERIAL1_illuminator"
@@ -407,14 +630,18 @@ def test_the_two_lights_do_not_share_a_unique_id():
 
 def test_name_is_prefixed_with_the_device_name():
     c = _Coordinator()
-    assert _light(DahuaInfraredLight, c, "Infrared").name == "Front Door Infrared"
+    # The string itself lives in translations/en.json and is pinned there by
+    # test_entity_names_come_from_translations.py. What belongs here is that
+    # this light declares a key rather than composing a name.
+    assert _light(DahuaInfraredLight, c).translation_key == "infrared"
 
 
 # --- Smart Dual Light restore regressions -----------------------------------
 
+
 async def test_duplicate_off_preserves_restored_camera_configuration():
     c = _Coordinator()
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
     await light.async_turn_off()
     assert c.client.operations == []
 
@@ -425,13 +652,15 @@ async def test_duplicate_off_preserves_restored_camera_configuration():
 
     assert c.client.operations == operations
     assert (c.client.scheme, c.client.light_mode, c.client.light_brightness) == (
-        "AIMode", "Manual", 64
+        "AIMode",
+        "Manual",
+        64,
     )
 
 
 async def test_brightness_update_keeps_original_profile_and_restore_snapshot():
     c = _Coordinator(channel=2, profile_mode="0")
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
     await light.async_turn_on()
     c._profile_mode = "1"
     c.illuminator_index = 1
@@ -445,17 +674,21 @@ async def test_brightness_update_keeps_original_profile_and_restore_snapshot():
 
 
 @pytest.mark.parametrize("restart", [False, True])
-@pytest.mark.parametrize("mode,brightness", [("Auto", 100), ("Off", 100), ("Manual", 42)])
-async def test_external_change_is_preserved_on_off_and_restart(restart, mode, brightness):
+@pytest.mark.parametrize(
+    "mode,brightness", [("Auto", 100), ("Off", 100), ("Manual", 42)]
+)
+async def test_external_change_is_preserved_on_off_and_restart(
+    restart, mode, brightness
+):
     c = _Coordinator()
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
     await light.async_turn_on()
     c.client.light_mode = mode
     c.client.light_brightness = brightness
     c.client.operations.clear()
 
     if restart:
-        recovered_light = _light(DahuaIlluminator, c, "Illuminator")
+        recovered_light = _light(DahuaIlluminator, c)
         recovered_light._restore_store = light._restore_store
         assert await recovered_light._recover_persisted_override() is True
     else:
@@ -469,7 +702,7 @@ async def test_external_change_is_preserved_on_off_and_restart(restart, mode, br
 async def test_external_scheme_change_is_preserved_on_off():
     """A Web UI scheme change must not be replaced by HA's saved baseline."""
     c = _Coordinator()
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
     await light.async_turn_on()
     c.client.scheme = "InfraredMode"
     c.client.operations.clear()
@@ -486,7 +719,7 @@ async def test_external_scheme_change_is_preserved_on_off():
 async def test_camera_reverting_scheme_to_baseline_still_restores_light():
     """A camera's own WhiteMode reversion must not block OFF cleanup."""
     c = _Coordinator()
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
     await light.async_turn_on()
     c.client.scheme = "AIMode"
     c.client.operations.clear()
@@ -501,7 +734,7 @@ async def test_camera_reverting_scheme_to_baseline_still_restores_light():
 
 async def test_interrupted_restore_resumes_after_restart(monkeypatch):
     c = _Coordinator()
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
     await light.async_turn_on()
     original_set = c.client.async_set_lighting_v2_raw
 
@@ -517,19 +750,21 @@ async def test_interrupted_restore_resumes_after_restart(monkeypatch):
     assert c.client.scheme == "InfraredMode"
 
     monkeypatch.setattr(c.client, "async_set_lighting_v2_raw", original_set)
-    recovered_light = _light(DahuaIlluminator, c, "Illuminator")
+    recovered_light = _light(DahuaIlluminator, c)
     recovered_light._restore_store = light._restore_store
     assert await recovered_light._recover_persisted_override() is True
     assert light._restore_store.data is None
     assert (c.client.scheme, c.client.light_mode, c.client.light_brightness) == (
-        "AIMode", "Manual", 64
+        "AIMode",
+        "Manual",
+        64,
     )
 
 
 async def test_illuminator_safe_restore_order():
     """WhiteLight must stay physically off while its original state is restored."""
     c = _Coordinator(channel=2, profile_mode="0")
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
 
     await light._restore_camera_lighting(
         (2, "0", "AIMode"),
@@ -550,7 +785,7 @@ async def test_persisted_recovery_restores_whitemode_baseline():
     c.client.scheme = "WhiteMode"
     c.client.light_brightness = dahua_utils.hass_brightness_to_dahua_brightness(180)
 
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
     light._restore_store.data = {
         "active": True,
         "scheme_channel": 2,
@@ -585,7 +820,7 @@ async def test_persisted_recovery_refuses_unknown_scheme():
     c.client.scheme = "SomethingElse"
     c.client.light_brightness = dahua_utils.hass_brightness_to_dahua_brightness(200)
 
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
     snapshot = {
         "active": True,
         "scheme_channel": 2,
@@ -616,7 +851,7 @@ async def test_persisted_recovery_clears_stale_snapshot():
     c.client.light_brightness = 88
     c.client.light_field = "NearLight"
 
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
     light._restore_store.data = {
         "active": True,
         "scheme_channel": 2,
@@ -641,7 +876,7 @@ async def test_persisted_recovery_clears_stale_snapshot():
 async def test_restore_off_mode_preserves_saved_brightness():
     """Mode=Off must still restore the saved brightness value exactly."""
     c = _Coordinator(channel=2, profile_mode="0")
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
 
     await light._restore_camera_lighting(
         (2, "0", "WhiteMode"),
@@ -669,7 +904,7 @@ async def test_persisted_recovery_repairs_partially_restored_state():
     c.client.light_brightness = 100
     c.client.light_field = "NearLight"
 
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
     light._restore_store.data = {
         "active": True,
         "scheme_channel": 2,
@@ -704,7 +939,7 @@ async def test_persisted_recovery_repairs_partially_restored_state():
 async def test_reboot_recovery_failure_leaves_generation_for_retry(monkeypatch):
     """Failed reboot recovery must not consume the reboot generation."""
     c = _Coordinator(channel=2, profile_mode="0")
-    light = _light(DahuaIlluminator, c, "Illuminator")
+    light = _light(DahuaIlluminator, c)
 
     light._manual_on = True
     light._seen_reboot_generation = 0

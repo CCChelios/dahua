@@ -12,13 +12,16 @@ Each entry probed `snapshot.cgi?channel=0` for itself, and a failure meant
     PROBE_FAILED = (ClientError, TimeoutError)
 
 Six entries on one recorder therefore sent six identical requests through a
-semaphore two wide, with the timeout covering the wait for a slot as well as the
-request. Whoever timed out kept `channel + 1` and pointed at the next channel's
-video, while the neighbour that won pointed at its own. Hence one camera shown
-twice, one missing, and a different result every restart.
+semaphore two wide, which at the time was queued for inside the request's own
+timeout, so a request could expire without ever being sent (that ordering is
+#1043, since separated). Whoever timed out kept `channel + 1` and pointed at
+the next channel's video, while the neighbour that won pointed at its own.
+Hence one camera shown twice, one missing, and a different result every
+restart.
 
 A timeout is not the device saying no. Only an HTTP status is.
 """
+
 import asyncio
 
 from aiohttp import ClientConnectionError, ClientResponseError
@@ -57,6 +60,7 @@ class _Client:
 
 # --- what the device actually said ------------------------------------------
 
+
 async def test_a_snapshot_at_zero_means_zero_indexed():
     _clean()
 
@@ -71,6 +75,7 @@ async def test_an_http_error_means_one_indexed():
 
 
 # --- what it did not say ----------------------------------------------------
+
 
 async def test_a_timeout_decides_nothing():
     """The #724 bug. This used to read as one-indexed and renumber the channel."""
@@ -98,6 +103,7 @@ async def test_a_timeout_does_not_poison_the_answer_for_everyone():
 
 # --- asked once for the device, not once per entry --------------------------
 
+
 async def test_six_entries_probe_once():
     _clean()
     client = _Client("ok")
@@ -114,7 +120,8 @@ async def test_entries_racing_at_startup_still_probe_once():
     client = _Client("ok", delay=0.01)
 
     results = await asyncio.gather(
-        *[async_device_is_zero_indexed(client, "d1") for _ in range(6)])
+        *[async_device_is_zero_indexed(client, "d1") for _ in range(6)]
+    )
 
     assert client.probes == 1
     assert results == [True] * 6, "the entries did not agree: %r" % (results,)
@@ -125,13 +132,15 @@ async def test_every_entry_gets_the_same_answer_when_it_is_no():
     client = _Client("refused", delay=0.01)
 
     results = await asyncio.gather(
-        *[async_device_is_zero_indexed(client, "d1") for _ in range(6)])
+        *[async_device_is_zero_indexed(client, "d1") for _ in range(6)]
+    )
 
     assert results == [False] * 6
     assert client.probes == 1
 
 
 # --- two devices are two questions ------------------------------------------
+
 
 async def test_two_devices_on_one_address_are_decided_separately():
     """One address can answer for two devices on different ports."""

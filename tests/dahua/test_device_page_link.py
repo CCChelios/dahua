@@ -22,19 +22,24 @@ from custom_components.dahua.entity import DahuaBaseEntity
 
 
 def _client(port, use_https=None):
-    return DahuaClient("u", "p", "1.2.3.4", port, 554, session=None,
-                       use_https=use_https)
+    return DahuaClient(
+        "u", "p", "1.2.3.4", port, 554, session=None, use_https=use_https
+    )
 
 
 # --- the client already knows, and now says so ------------------------------
 
-@pytest.mark.parametrize("port,use_https,expected", [
-    (80, None, "http://1.2.3.4:80"),
-    (443, None, "https://1.2.3.4:443"),
-    (8000, None, "http://1.2.3.4:8000"),
-    (8443, True, "https://1.2.3.4:8443"),
-    (80, True, "https://1.2.3.4:80"),
-])
+
+@pytest.mark.parametrize(
+    "port,use_https,expected",
+    [
+        (80, None, "http://1.2.3.4:80"),
+        (443, None, "https://1.2.3.4:443"),
+        (8000, None, "http://1.2.3.4:8000"),
+        (8443, True, "https://1.2.3.4:8443"),
+        (80, True, "https://1.2.3.4:80"),
+    ],
+)
 def test_the_client_reports_the_url_it_uses(port, use_https, expected):
     assert _client(port, use_https).base_url() == expected
 
@@ -64,28 +69,46 @@ def test_the_coordinator_hands_on_the_clients_url():
 
 # --- and the device page uses it --------------------------------------------
 
+
 def _device_info(url):
     entity = object.__new__(DahuaBaseEntity)
     entity._coordinator = SimpleNamespace(
         get_serial_number=lambda: "SER123",
+        get_device_serial_number=lambda: "SER123",
+        uses_separate_host_device=lambda: False,
+        host_device_identifier=lambda: "SER123_host",
+        # Serial and device serial match and there is no host device, so this
+        # page is the box's page as well as the channel's.
+        stands_in_for_the_host=lambda: True,
         get_device_name=lambda: "Front Door",
         get_model=lambda: "IPC-HDW5831R",
         get_firmware_version=lambda: "2.800",
         get_configuration_url=lambda: url,
         configured_area_name=lambda: None,
+        # A standalone camera: the recorder's camera table says nothing about
+        # it, so device_info falls back to what the device reports about
+        # itself. The recorder case is in test_the_camera_behind_the_channel.py.
+        get_channel_model=lambda: None,
+        get_channel_serial_number=lambda: None,
+        get_channel_firmware_version=lambda: None,
+        get_channel_mac=lambda: None,
     )
     return entity.device_info
 
 
 def test_the_visit_link_carries_the_port():
     """The whole point. "http://1.2.3.4" on a device serving 8000 goes nowhere."""
-    assert _device_info("http://1.2.3.4:8000")["configuration_url"] == \
-        "http://1.2.3.4:8000"
+    assert (
+        _device_info("http://1.2.3.4:8000")["configuration_url"]
+        == "http://1.2.3.4:8000"
+    )
 
 
 def test_the_visit_link_keeps_https():
-    assert _device_info("https://1.2.3.4:443")["configuration_url"] == \
-        "https://1.2.3.4:443"
+    assert (
+        _device_info("https://1.2.3.4:443")["configuration_url"]
+        == "https://1.2.3.4:443"
+    )
 
 
 def test_the_link_is_not_rebuilt_from_the_address():
@@ -93,9 +116,9 @@ def test_the_link_is_not_rebuilt_from_the_address():
     can disagree and only one of them is talking to the device."""
     info = _device_info("https://1.2.3.4:8443")
 
-    assert not info["configuration_url"].startswith("http://"), (
-        "an https device must not be linked over plain http"
-    )
+    assert not info["configuration_url"].startswith(
+        "http://"
+    ), "an https device must not be linked over plain http"
     assert ":8443" in info["configuration_url"]
 
 

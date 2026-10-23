@@ -26,6 +26,8 @@ from custom_components.dahua.switch import (
     DahuaSmartMotionDetectionBinarySwitch,
 )
 
+from . import adds_entities
+
 CONFIGURATION_SWITCHES = [
     DahuaMotionDetectionBinarySwitch,
     DahuaDisarmingLinkageBinarySwitch,
@@ -46,6 +48,7 @@ def _category(cls):
 
 # --- switches ---------------------------------------------------------------
 
+
 def test_the_configuration_switches_say_they_are_configuration():
     for cls in CONFIGURATION_SWITCHES:
         assert _category(cls) is EntityCategory.CONFIG, cls.__name__
@@ -58,20 +61,46 @@ def test_the_siren_is_left_as_a_control():
 
 # --- diagnostic sensors -----------------------------------------------------
 
+
 def _coordinator():
     c = SimpleNamespace(
+        # The platforms file entities under the channel's subentry, so they
+        # read this on every entity they add.
+        subentry_id=None,
         get_device_name=lambda: "Garage",
-        get_serial_number=lambda: "SERIAL1_4",   # channel-suffixed entity key
+        get_serial_number=lambda: "SERIAL1_4",  # channel-suffixed entity key
         get_device_serial_number=lambda: "SERIAL1",  # what the device reports
         get_firmware_version=lambda: "2.800.0",
         get_profile_mode=lambda: "1",
+        # None so the configured-channels sensor is not created here; this
+        # double is a camera, not a recorder.
+        get_configured_channel_count=lambda: None,
+        # Setup asks every channel this before the per-channel loop, to decide
+        # which one carries the device's processor and memory sensors. False, so
+        # the entities each test below names are the only ones added.
+        supports_system_load=lambda: False,
+        # And this decides whether those sensors go under the channel's
+        # subentry or the entry itself. Never reached while the answer above is
+        # False, but a setup double answers every question its platform asks.
+        uses_separate_host_device=lambda: False,
+        # A channel of a recorder: its entity key carries the suffix, so this
+        # page is the camera's and not the box's. The firmware and serial
+        # sensors read this to decide which identity to report.
+        stands_in_for_the_host=lambda: False,
+        # Nothing read the recorder's slot table for this double, so both fall
+        # back to what the device reports about itself, which is what every
+        # assertion in this file was written against.
+        get_channel_firmware_version=lambda: None,
+        get_channel_serial_number=lambda: None,
     )
     return c
 
 
 @pytest.fixture(autouse=True)
 def _skip_ha_plumbing(monkeypatch):
-    monkeypatch.setattr(sensor_module.DahuaBaseEntity, "__init__", lambda self, c, e: None)
+    monkeypatch.setattr(
+        sensor_module.DahuaBaseEntity, "__init__", lambda self, c, e: None
+    )
 
 
 def _sensor(cls, coordinator):
@@ -82,7 +111,11 @@ def _sensor(cls, coordinator):
 
 
 def test_both_sensors_are_diagnostics():
-    for cls in (DahuaFirmwareVersionSensor, DahuaSerialNumberSensor, DahuaProfileSensor):
+    for cls in (
+        DahuaFirmwareVersionSensor,
+        DahuaSerialNumberSensor,
+        DahuaProfileSensor,
+    ):
         assert _category(cls) is EntityCategory.DIAGNOSTIC, cls.__name__
 
 
@@ -94,8 +127,17 @@ def test_the_profile_sensor_reports_the_named_profile():
     assert _sensor(DahuaProfileSensor, _coordinator()).native_value == "Night"
 
 
-def test_the_serial_sensor_reports_the_device_serial_not_the_entity_key():
-    """Every channel of one NVR is the same box and must say the same serial."""
+def test_the_serial_sensor_reports_a_serial_not_the_entity_key():
+    """`get_serial_number` appends the channel so that each channel's entities
+    get distinct keys. That composite is this integration's bookkeeping and is
+    not a serial number, so it must never be what the sensor shows.
+
+    This used to say "every channel of one NVR is the same box and must say the
+    same serial", which stopped being the behaviour when a channel's device page
+    started describing the camera in that slot. Which identity it reports is
+    covered in test_the_sensors_agree_with_their_page.py; what survives here is
+    that it is a serial either way.
+    """
     value = _sensor(DahuaSerialNumberSensor, _coordinator()).native_value
 
     assert value == "SERIAL1"
@@ -106,51 +148,141 @@ def test_the_sensors_do_not_collide():
     c = _coordinator()
     ids = [
         _sensor(cls, c).unique_id
-        for cls in (DahuaFirmwareVersionSensor, DahuaSerialNumberSensor, DahuaProfileSensor)
+        for cls in (
+            DahuaFirmwareVersionSensor,
+            DahuaSerialNumberSensor,
+            DahuaProfileSensor,
+        )
     ]
 
     assert len(set(ids)) == len(ids)
     assert all(i.startswith("SERIAL1_4_") for i in ids)
 
 
-def test_the_sensors_are_named_after_the_device():
+def test_the_sensors_name_themselves_through_the_translation_file():
+    """This has been through two rounds of the same idea. It began as "the name
+    starts with Garage", which was right while the entity composed the whole
+    thing; `has_entity_name` moved the device half to Home Assistant, so it
+    became "the name does not contain Garage"; and `entity-translations` moved
+    the entity half into translations/en.json, so the string is not on the class
+    at all any more and the key is what is left to check.
+
+    The strings, and that they are unchanged from what the properties returned,
+    are pinned in test_entity_names_come_from_translations.py."""
+    # Off an instance: `_attr_translation_key` read from the class is a
+    # property object, courtesy of the CachedProperties metaclass, and a
+    # property object is truthy. This assertion passed for a class that
+    # declared nothing at all until it was written this way.
     c = _coordinator()
-    for cls in (DahuaFirmwareVersionSensor, DahuaSerialNumberSensor, DahuaProfileSensor):
-        assert _sensor(cls, c).name.startswith("Garage "), cls.__name__
+    for cls in (
+        DahuaFirmwareVersionSensor,
+        DahuaSerialNumberSensor,
+        DahuaProfileSensor,
+    ):
+        assert _sensor(cls, c).translation_key, cls.__name__
 
 
 # --- the profile sensor is gated on the capability -------------------------------
 
-def _setup_coordinator(profile_support):
+
+def _setup_coordinator(profile_support, no_video=False):
     c = _coordinator()
     c.supports_profile_mode = lambda: profile_support
+    c.is_indoor_monitor_without_video = lambda: no_video
     return c
 
 
 def _setup(coordinator):
-    hass = type("H", (), {"data": {"dahua": {"e1": coordinator}}})()
-    entry = type("E", (), {"entry_id": "e1"})()
+    hass = type("H", (), {"data": {}})()
+    entry = type(
+        "E",
+        (),
+        {
+            "entry_id": "e1",
+            "runtime_data": {0: coordinator},
+            # Setup keeps a listener for capabilities that turn up on a later
+            # poll, and registers its removal here (#1057).
+            "async_on_unload": staticmethod(lambda unsub: None),
+        },
+    )()
     added = []
     return hass, entry, added
 
 
 async def test_the_profile_sensor_is_only_added_when_profile_mode_is_supported():
     hass, entry, added = _setup(_setup_coordinator(profile_support=True))
-    await sensor_module.async_setup_entry(hass, entry, added.extend)
+    await sensor_module.async_setup_entry(hass, entry, adds_entities(added))
     assert any(isinstance(s, DahuaProfileSensor) for s in added)
+
+
+async def test_the_profile_sensor_arrives_when_the_probe_finally_answers(hass):
+    """The platform's half of #1057, through the real dispatcher.
+
+    The coordinator asking the Lighting profile again is only half of it:
+    nothing creates the sensor from a late answer unless this platform is
+    listening for one. Driven through the real `hass` and the real
+    dispatcher, because the bug #1063 fixed in the same mechanism was
+    invisible to every test that faked them.
+    """
+    from custom_components.dahua import late
+
+    answered = {"yet": False}
+    coordinator = _setup_coordinator(profile_support=False)
+    coordinator.supports_profile_mode = lambda: answered["yet"]
+    entry = type(
+        "E",
+        (),
+        {
+            "entry_id": "e1",
+            "runtime_data": {0: coordinator},
+            "async_on_unload": staticmethod(lambda unsub: None),
+        },
+    )()
+    added = []
+
+    await sensor_module.async_setup_entry(hass, entry, adds_entities(added))
+    assert not any(isinstance(s, DahuaProfileSensor) for s in added)
+
+    answered["yet"] = True
+    late.async_notify_capability_discovered(hass, "e1", coordinator.get_serial_number())
+    await hass.async_block_till_done()
+
+    assert any(
+        isinstance(s, DahuaProfileSensor) for s in added
+    ), "the device answered and the sensor it gates was not created"
 
 
 async def test_no_profile_sensor_without_profile_support():
     """The profile stays "0" (Day) forever on such a device; a wrong value
     looks like a working one, so no sensor is better."""
     hass, entry, added = _setup(_setup_coordinator(profile_support=False))
-    await sensor_module.async_setup_entry(hass, entry, added.extend)
+    await sensor_module.async_setup_entry(hass, entry, adds_entities(added))
     assert not any(isinstance(s, DahuaProfileSensor) for s in added)
 
 
 async def test_the_diagnostic_sensors_are_always_added():
     hass, entry, added = _setup(_setup_coordinator(profile_support=False))
-    await sensor_module.async_setup_entry(hass, entry, added.extend)
+    await sensor_module.async_setup_entry(hass, entry, adds_entities(added))
     names = [type(s).__name__ for s in added]
     assert "DahuaFirmwareVersionSensor" in names
     assert "DahuaSerialNumberSensor" in names
+
+
+async def test_an_indoor_monitor_without_a_camera_gets_no_license_plate_sensor():
+    """A plate is read from a picture. The diagnostic sensors stay."""
+    hass, entry, added = _setup(
+        _setup_coordinator(profile_support=False, no_video=True)
+    )
+    await sensor_module.async_setup_entry(hass, entry, adds_entities(added))
+    names = [type(s).__name__ for s in added]
+
+    assert "DahuaLicensePlateSensor" not in names
+    assert "DahuaFirmwareVersionSensor" in names
+    assert "DahuaSerialNumberSensor" in names
+
+
+async def test_a_camera_still_gets_the_license_plate_sensor():
+    hass, entry, added = _setup(_setup_coordinator(profile_support=False))
+    await sensor_module.async_setup_entry(hass, entry, adds_entities(added))
+
+    assert "DahuaLicensePlateSensor" in [type(s).__name__ for s in added]

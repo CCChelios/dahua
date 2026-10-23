@@ -2,14 +2,14 @@
 Event entity platform for Dahua.
 https://developers.home-assistant.io/docs/core/entity/event
 """
+
 import logging
 
 from homeassistant.components.event import EventDeviceClass, EventEntity
 from homeassistant.core import HomeAssistant, callback
 
-from custom_components.dahua import DahuaDataUpdateCoordinator
+from custom_components.dahua import entry_coordinators
 
-from .const import DOMAIN
 from .entity import DahuaEventDrivenEntity
 
 _LOGGER = logging.getLogger(__package__)
@@ -23,19 +23,27 @@ DOORBELL_PRESSED = "DoorbellPressed"
 #             and DoorbellEventType.RING not in self.event_types):
 #
 # Spelled out rather than imported as DoorbellEventType.RING, because that
-# enum is newer than the 2025.1.2 this integration supports. It is a StrEnum
+# enum is newer than the oldest Home Assistant this integration supports
+# (2026.8.0, per hacs.json). It is a StrEnum
 # with "ring" as its only member, so the literal is the same value.
 EVENT_RING = "ring"
 
 
+# A coordinator centralises the inbound reads, and nothing here sends a command,
+# so there is nothing to serialise: read only: fired by the event stream, never polled.
+PARALLEL_UPDATES = 0
+
+
 async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
     """Setup the event platform."""
-    coordinator: DahuaDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-
-    # Only a doorbell has a button to press. On anything else this entity would
-    # sit at unknown for ever, which is worse than not offering it.
-    if coordinator.is_doorbell():
-        async_add_devices([DahuaDoorbellEvent(coordinator, entry)])
+    for coordinator in entry_coordinators(entry).values():
+        # Only a doorbell has a button to press. On anything else this entity would
+        # sit at unknown for ever, which is worse than not offering it.
+        if coordinator.is_doorbell():
+            async_add_devices(
+                [DahuaDoorbellEvent(coordinator, entry)],
+                config_subentry_id=coordinator.subentry_id,
+            )
 
 
 class DahuaDoorbellEvent(DahuaEventDrivenEntity, EventEntity):
@@ -54,10 +62,7 @@ class DahuaDoorbellEvent(DahuaEventDrivenEntity, EventEntity):
 
     _attr_device_class = EventDeviceClass.DOORBELL
     _attr_event_types = [EVENT_RING]
-
-    @property
-    def name(self):
-        return self._coordinator.get_device_name() + " Doorbell"
+    _attr_translation_key = "doorbell"
 
     @property
     def unique_id(self):
@@ -77,9 +82,12 @@ class DahuaDoorbellEvent(DahuaEventDrivenEntity, EventEntity):
             self.async_write_ha_state()
 
     async def async_added_to_hass(self):
-        """Listen for the press."""
-        self._coordinator.add_dahua_event_listener(
-            DOORBELL_PRESSED, self._async_doorbell_pressed)
+        """Listen for the press, and stop listening when removed."""
+        self.async_on_remove(
+            self._coordinator.add_dahua_event_listener(
+                DOORBELL_PRESSED, self._async_doorbell_pressed
+            )
+        )
 
     @property
     def should_poll(self) -> bool:

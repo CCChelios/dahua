@@ -12,6 +12,8 @@ from custom_components.dahua.rpc2 import DahuaRpc2Client
 from custom_components.dahua.diagnostics import _capabilities_block
 from tests.dahua.test_direct_rpc2_deterrence import coordinator
 
+from . import adds_entities
+
 RED_BLUE = {
     "LinkingDetail": {
         "FilckerLighting": {"Support": True, "LightType": ["RedBlueLight"]}
@@ -463,8 +465,13 @@ async def test_diagnostics_adjacent_sources_match_capability_and_make_no_request
 @pytest.mark.parametrize("platform", ["switch", "light"])
 @pytest.mark.parametrize(
     "device_class,channel,opt_in,expected",
-    [("SD", 1, False, True), ("NVR", 0, False, False), ("NVR", 0, True, True),
-     ("", 0, True, True), ("", 1, True, True)],
+    [
+        ("SD", 1, False, True),
+        ("NVR", 0, False, False),
+        ("NVR", 0, True, True),
+        ("", 0, True, True),
+        ("", 1, True, True),
+    ],
 )
 async def test_entity_creation_uses_host_class_not_channel(
     monkeypatch, platform, device_class, channel, opt_in, expected
@@ -484,6 +491,7 @@ async def test_entity_creation_uses_host_class_not_channel(
         "supports_privacy_mode",
         "supports_alarm_output",
         "supports_disarming_linkage",
+        "supports_event_notifications",
     ):
         setattr(c, name, lambda: False)
     monkeypatch.setattr(
@@ -497,9 +505,13 @@ async def test_entity_creation_uses_host_class_not_channel(
         )
     added = []
     await module.async_setup_entry(
-        SimpleNamespace(data={"dahua": {"entry": c}}),
-        SimpleNamespace(entry_id="entry"),
-        added.extend,
+        SimpleNamespace(data={}),
+        SimpleNamespace(
+            entry_id="entry",
+            runtime_data={0: c},
+            async_on_unload=lambda unsub: None,
+        ),
+        adds_entities(added),
     )
     assert ("deterrence" in added) is expected
 

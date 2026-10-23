@@ -10,7 +10,7 @@ jobs:
     runs-on: "ubuntu-latest"
     name: Validate
     steps:
-        - uses: "actions/checkout@v2"
+        - uses: "actions/checkout@v7"
 
         - name: HACS validation
           uses: "hacs/action@main"
@@ -24,24 +24,38 @@ jobs:
     runs-on: "ubuntu-latest"
     name: Check style formatting
     steps:
-        - uses: "actions/checkout@v2"
-        - uses: "actions/setup-python@v1"
+        - uses: "actions/checkout@v7"
+        - uses: "actions/setup-python@v7"
           with:
             python-version: "3.x"
-        - run: python3 -m pip install black
-        - run: black .
+        - run: python3 -m pip install black==26.10.0
+        - run: black --check .
 
   tests:
     runs-on: "ubuntu-latest"
     name: Run tests
     steps:
       - name: Check out code from GitHub
-        uses: "actions/checkout@v2"
+        uses: "actions/checkout@v7"
       - name: "Set up Python"
-        uses: actions/setup-python@v5.3.0
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
           cache: "pip"
+      - name: Install ffmpeg
+        # The format table is checked against a real ffmpeg rather than
+        # against itself, because a wrong byte rate there plays every clip at
+        # the wrong speed. The runner image does not ship ffmpeg, so those
+        # four parameters skipped on every run since they were written and
+        # the assertion had never executed anywhere.
+        #
+        # The binary alone is enough: the test invokes it directly rather than
+        # through Home Assistant's ffmpeg integration, which would also need
+        # `haffmpeg` and is not what is under test.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
       - name: Install requirements
         run: python3 -m pip install -r requirements_test.txt
       - name: Run tests

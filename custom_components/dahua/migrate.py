@@ -1,0 +1,675 @@
+"""Merge a recorder's per-channel config entries into one entry per device.
+
+A recorder was added as one config entry per channel, so removing a 64 channel
+NVR meant 64 deletions and adding one meant 64 trips through the add form (#827).
+This moves each host onto a single entry with one subentry per channel, which is
+the shape Home Assistant expects from a hub and the shape its own delete button
+already understands.
+
+## Why this is safe for entities
+
+Every entity `unique_id` is built from `get_serial_number()`, which is
+`{serial}_{channel}` for a channel and the bare serial for channel 0. None of
+them derives from the config entry, and `device_info` identifiers are the same
+value. So the merge re-parents rows rather than rebuilding them: entity ids
+survive, and with them dashboards, automations, scripts, areas, name overrides
+and recorder history.
+
+Measured on a real install before this was written: 10 entries, 232 entities and
+10 devices merged with every entity id, unique id and device id byte identical.
+
+## Two things that are load bearing
+
+**Entities move before devices.** A device belongs to exactly one config entry
+from Home Assistant 2026.8, so moving a device first leaves its entities pointing
+at an entry that no longer owns it, and Home Assistant resolves that by deleting
+them. Doing it in the intuitive order sent all 232 entities to `deleted_entities`
+in testing. Entities first, devices second, and nothing is removed until it owns
+nothing.
+
+**This has to run before any platform loads.** `async_update_entity_platform`
+refuses an entity that is already loaded, and Home Assistant sets up config
+entries concurrently, so a per-entry `async_migrate_entry` could fire while
+another channel's entities are live. It runs from `async_setup`, which happens
+once and before any entry.
+
+## Reversibility
+
+There is none, so a backup is taken first. An older version cannot read an entry
+with subentries, so downgrading is not a route back, and the registries are Home
+Assistant's own state rather than ours to reconstruct. The copies are written
+before the first mutation and their location is logged at warning level so it is
+in the log the user will be reading if something went wrong.
+
+The timing makes the copies accurate rather than approximate: this runs during
+`async_setup`, when the registries have just been read from those files and
+nothing has modified them yet.
+"""
+
+import logging
+import os
+import shutil
+import tempfile
+import time
+
+from homeassistant.config_entries import ConfigSubentry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
+
+from . import ISSUE_SIBLINGS_REMAIN
+from .const import CHANNEL_OPTION_KEYS, CONF_ADDRESS, CONF_CHANNEL, CONF_PORT, DOMAIN
+from .host import is_synthesised_identity, normalize_address
+
+_LOGGER: logging.Logger = logging.getLogger(__package__)
+
+# The registry files worth keeping a copy of. Nothing else is touched.
+BACKED_UP = (
+    "core.config_entries",
+    "core.device_registry",
+    "core.entity_registry",
+)
+
+# Shared with the config flow so a merged recorder and a freshly added one
+# look identical, and so a subentry reconfigure flow can be registered for
+# one type rather than two.
+CHANNEL_SUBENTRY = "channel"
+
+
+def _channel_settings(entry) -> dict:
+    """What this channel is actually configured with, not what it was added with.
+
+    A subentry's data is where a merged recorder keeps one channel's own answers,
+    and `channel_option` reads it before the entry's options. Copying only
+    `entry.data` therefore did not just fail to carry the user's later changes: it
+    made the add-time value *shadow* them, permanently, for every key stored in
+    both. A channel whose events were changed from VideoMotion to SmartMotionHuman
+    in Configure went back to VideoMotion at migration and could not be corrected
+    through the entry's options again, and an empty selection was lost the same way.
+
+    Only the per-channel keys are overlaid. A host-wide option left here would be
+    frozen onto each channel instead of continuing to follow the host.
+
+    Reported by alpha520098 on #825, who also identified the key set.
+    """
+    settings = dict(entry.data)
+    settings.update(
+        {
+            key: value
+            for key, value in (entry.options or {}).items()
+            if key in CHANNEL_OPTION_KEYS
+        }
+    )
+    return settings
+
+
+def _channel_of(entry) -> int:
+    """This entry's channel index, as an int whatever it was stored as.
+
+    The add flow writes it as a string for extra channels and leaves it absent
+    for the first, so both shapes are in the wild.
+    """
+    try:
+        return int(entry.data.get(CONF_CHANNEL, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _address_of(entry) -> str:
+    return (entry.data.get(CONF_ADDRESS) or "").strip().rstrip("/").lower()
+
+
+def _port_of(entry) -> str:
+    """Which of the device behind an address this entry is.
+
+    Two Dahua boxes can sit behind one IP on different ports -- a bridge
+    forwarding 80/554 to one and 81/555 to another, which the rest of the
+    integration already treats as two devices (client.py's device_key). Grouping
+    by address alone folded the second device's channel 0 onto the first device's
+    subentry, so its configuration was dropped and its entities were re-parented
+    to the wrong camera. The default stands in for an entry that predates the
+    field, which is what it was using.
+    """
+    return str(entry.data.get(CONF_PORT) or "80")
+
+
+def _subentry_unique_id(address: str, channel: int) -> str:
+    return "%s_%d" % (address, channel)
+
+
+def _rows_span_multiple_subentries(rows) -> bool:
+    """Whether these registry rows sit across more than one subentry."""
+    seen = set()
+    for row in rows:
+        subentry_id = getattr(row, "config_subentry_id", None)
+        if subentry_id is not None:
+            seen.add(subentry_id)
+            if len(seen) > 1:
+                return True
+    return False
+
+
+def _has_finished_merging(entities, devices, entry) -> bool:
+    """Whether this entry is a recorder that has already *finished* merging.
+
+    This is the signal that separates a finished merge from one still in progress,
+    and getting it right is the whole of #972. Both have subentries, because they
+    are all created before any row moves, so the presence of subentries alone
+    cannot tell them apart. What differs is where the rows sit. A finished recorder
+    has them spread across a subentry per channel. A partial merge has them still
+    on the flat entries it has not folded in yet, so the entry that carries the
+    subentries holds rows under at most one of them.
+
+    Re-grouping a finished recorder is the bug: the merge reads it as one channel
+    and moves every channel's rows onto a single subentry. A partial merge, by
+    contrast, must be re-entered and finished, so it must *not* match here.
+
+    Both registries are checked: the entity spread catches every real recorder
+    (a working channel has entities), and the device spread closes the gap where a
+    channel registered a device but no entity. `config_subentry_id` is the field
+    on both a RegistryEntry and a DeviceEntry; read defensively so a registry that
+    does not carry it simply contributes nothing rather than raising.
+    """
+    return _rows_span_multiple_subentries(
+        er.async_entries_for_config_entry(entities, entry.entry_id)
+    ) or _rows_span_multiple_subentries(
+        dr.async_entries_for_config_entry(devices, entry.entry_id)
+    )
+
+
+def _backup(hass: HomeAssistant, label: str = "pre-merge") -> str | None:
+    """Copy the registries somewhere the user can find them. Blocking."""
+    storage = hass.config.path(".storage")
+    target = hass.config.path(
+        "dahua-%s-backup-%s" % (label, time.strftime("%Y%m%d-%H%M%S"))
+    )
+    copied = []
+    try:
+        if label == "pre-serial":
+            # Config entries contain credentials. Use a private, unique
+            # directory, including when two entries migrate in the same second.
+            target = tempfile.mkdtemp(
+                prefix="dahua-pre-serial-backup-", dir=hass.config.path()
+            )
+        else:
+            os.makedirs(target, exist_ok=True)
+        for name in BACKED_UP:
+            source = os.path.join(storage, name)
+            if os.path.exists(source):
+                shutil.copy2(source, os.path.join(target, name))
+                copied.append(name)
+    except OSError:
+        _LOGGER.exception(
+            "Could not back up the Home Assistant registries before merging "
+            "Dahua entries. The merge has NOT been attempted"
+        )
+        return None
+    if not copied or (label == "pre-serial" and set(copied) != set(BACKED_UP)):
+        return None
+    return target
+
+
+async def async_drop_duplicate_disk_sensors(hass: HomeAssistant, entry) -> None:
+    """Remove the disk sensors every channel of a recorder used to create.
+
+    `storageDevice.cgi?action=getDeviceAllInfo` takes no channel: the disks
+    belong to the box. Every channel coordinator answered that question anyway
+    and created its own sensor for each disk, so a twelve channel recorder with
+    four bays carried forty eight entities describing four disks, each filed
+    under a device named after a camera.
+
+    They are created once now, keyed on the device serial. On channel 0 that is
+    the same string as before, so the surviving four keep their ids, their
+    history and anything pointing at them. These are the rest.
+
+    **The safety property, and the reason this is not a pattern match alone: a
+    duplicate is only removed when the surviving id is present.** So if a
+    recorder's entry has no channel 0 -- the canonical id would be one nothing
+    has created yet -- this leaves every row alone rather than deleting the only
+    copy of a disk. Clutter is a better failure than loss, and #891 is why that
+    is spelled out.
+    """
+    registry = er.async_get(hass)
+    rows = er.async_entries_for_config_entry(registry, entry.entry_id)
+    by_unique_id = {row.unique_id: row for row in rows}
+
+    doomed = []
+    for unique_id, row in by_unique_id.items():
+        head, separator, slug = (unique_id or "").partition("_disk_")
+        if not separator or not slug:
+            continue
+        # `<serial>_<channel>_disk_<slug>` is a duplicate; `<serial>_disk_<slug>`
+        # is the one that stays. rpartition so a serial containing an underscore
+        # cannot be mistaken for a channel.
+        serial, underscore, channel = head.rpartition("_")
+        if not underscore or not channel.isdigit():
+            continue
+        survivor = "%s_disk_%s" % (serial, slug)
+        if survivor != unique_id and survivor in by_unique_id:
+            doomed.append(row)
+
+    if not doomed:
+        return
+
+    where = await hass.async_add_executor_job(_backup, hass, "pre-disk-cleanup")
+    if where is None:
+        _LOGGER.warning(
+            "Could not back up the registries, so the %d duplicate Dahua disk "
+            "sensors have been left alone. They are disabled by default and "
+            "harmless; remove them from the entity list if you want them gone",
+            len(doomed),
+        )
+        return
+
+    for row in doomed:
+        registry.async_remove(row.entity_id)
+
+    _LOGGER.info(
+        "Removed %d duplicate disk sensors: a recorder's channels each created "
+        "one per disk, and they are now created once for the device. The ones "
+        "that remain keep their entity ids and history. Registries backed up to "
+        "%s first",
+        len(doomed),
+        where,
+    )
+
+
+async def async_merge_channel_entries(hass: HomeAssistant) -> None:
+    """Merge every host's per-channel entries into one entry per host.
+
+    Does nothing for a host that already has one entry, which is every single
+    camera and every host already merged, so the common case costs one grouping
+    pass and no writes at all.
+    """
+    entries = hass.config_entries.async_entries(DOMAIN)
+
+    by_host: dict[tuple[str, str], list] = {}
+    for entry in entries:
+        if entry.disabled_by is not None:
+            # Left exactly as it is, and not counted towards whether this host
+            # needs merging. Disabling an entry is how somebody parks a channel
+            # whose camera has gone without throwing its history away, and
+            # folding it in would undo that in two different ways.
+            #
+            # It would be silently re-enabled: its entities would move onto the
+            # survivor, which is enabled, so a camera the user switched off starts
+            # polling again with nothing said.
+            #
+            # Worse, the survivor is the lowest channel and nothing here looked at
+            # `disabled_by`, so a disabled channel 0 *became* the survivor: every
+            # other channel's entities would be moved onto a disabled entry, which
+            # Home Assistant never sets up, and the other entries are then removed.
+            # A whole recorder goes dark on upgrade, and only the registry copies
+            # taken above are the way back.
+            continue
+        address = _address_of(entry)
+        if address:
+            by_host.setdefault((address, _port_of(entry)), []).append(entry)
+
+    candidates = {host: group for host, group in by_host.items() if len(group) > 1}
+    if not candidates:
+        return
+
+    # Only a host with more than one entry can need merging, so the registries
+    # are read only now, not on the common no-op pass.
+    entities = er.async_get(hass)
+    devices = dr.async_get(hass)
+    hosts = {}
+    for host, group in candidates.items():
+        if any(_has_finished_merging(entities, devices, entry) for entry in group):
+            # One of these entries has already finished merging: its entities are
+            # spread across a subentry per channel. The merge assumes one entry is
+            # one channel, so folding this host would move every one of that
+            # entry's channels onto a single subentry and discard the rest. No
+            # entity is lost, so the count guards would not catch it; only the
+            # per-channel structure is destroyed (#972). It arises when a channel
+            # disabled at the first merge is later re-enabled, leaving a finished
+            # recorder beside a flat entry for that channel. Leave the host as it
+            # is -- the entries still work, and this run takes no backup. A merge
+            # still in progress is deliberately not caught here: it has subentries
+            # too, but has not spread its entities across them yet, so it can be
+            # re-entered and finished.
+            _LOGGER.debug(
+                "Not merging %s: an entry here has already finished merging "
+                "(its entities span its subentries) and sits beside %d other "
+                "entr(y/ies). Re-merging would collapse its per-channel "
+                "structure, so it is left as it is",
+                host[0],
+                len(group) - 1,
+            )
+            continue
+        hosts[host] = group
+    if not hosts:
+        return
+
+    backup = await hass.async_add_executor_job(_backup, hass)
+    if backup is None:
+        return
+
+    _LOGGER.warning(
+        "Merging Dahua config entries so each recorder is one device instead of "
+        "one entry per channel. %d host(s) affected. Copies of the Home "
+        "Assistant registries were saved to %s first; this cannot be undone from "
+        "inside Home Assistant, so keep them until you are happy",
+        len(hosts),
+        backup,
+    )
+
+    for (address, _port), group in hosts.items():
+        try:
+            await _async_merge_host(hass, address, group)
+        except Exception:  # pylint: disable=broad-except
+            # One recorder failing must not take the others with it, and must not
+            # take setup down: the entries are still individually usable in the
+            # shape they are in, which is exactly the shape they were in before.
+            _LOGGER.exception(
+                "Could not merge the Dahua entries for %s. They are unchanged or "
+                "partly merged; the registry copies in %s are the way back",
+                address,
+                backup,
+            )
+
+
+async def _async_merge_host(hass: HomeAssistant, address: str, group: list) -> None:
+    """Move every channel of one host onto a single entry with subentries."""
+    entities = er.async_get(hass)
+    devices = dr.async_get(hass)
+
+    ordered = sorted(group, key=_channel_of)
+    survivor = ordered[0]
+
+    # Idempotent: a subentry per channel already present means this host has been
+    # done, and a half finished run can be re-entered without duplicating any.
+    #
+    # Added to as the loop goes, not only read. Two entries can claim the same
+    # channel of the same host -- a device that reports no serial number gets no
+    # unique id, so nothing stopped it being added twice -- and Home Assistant
+    # raises on a second subentry with the same unique id. Snapshotting this
+    # before the loop meant that raise came from inside the merge, after some
+    # entities had already moved. Both entries now fold onto the one channel,
+    # which is what they always were.
+    existing = {
+        subentry.unique_id: subentry_id
+        for subentry_id, subentry in survivor.subentries.items()
+    }
+
+    subentry_for: dict[str, str] = {}
+    for entry in ordered:
+        channel = _channel_of(entry)
+        unique_id = _subentry_unique_id(address, channel)
+        if unique_id in existing:
+            subentry_for[entry.entry_id] = existing[unique_id]
+            continue
+        subentry = ConfigSubentry(
+            data=_channel_settings(entry),
+            subentry_type=CHANNEL_SUBENTRY,
+            title=entry.title or "Channel %d" % channel,
+            unique_id=unique_id,
+        )
+        hass.config_entries.async_add_subentry(survivor, subentry)
+        existing[unique_id] = subentry.subentry_id
+        subentry_for[entry.entry_id] = subentry.subentry_id
+
+    # Counted before anything moves, so the check at the end is against what was
+    # actually there rather than against what we expect to have done.
+    expected = sum(
+        len(er.async_entries_for_config_entry(entities, entry.entry_id))
+        for entry in ordered
+    )
+
+    # Entities first. See the module docstring: moving a device first makes Home
+    # Assistant delete the entities that still point at the old entry.
+    moved = 0
+    for entry in ordered:
+        subentry_id = subentry_for[entry.entry_id]
+        for row in list(er.async_entries_for_config_entry(entities, entry.entry_id)):
+            entities.async_update_entity_platform(
+                row.entity_id,
+                DOMAIN,
+                new_config_entry_id=survivor.entry_id,
+                new_config_subentry_id=subentry_id,
+            )
+            moved += 1
+
+    # Checked here, before a single device is touched, because this is the last
+    # moment at which stopping costs nothing. Moving a device whose entities are
+    # not already on the survivor is what makes Home Assistant delete them, so a
+    # check afterwards can only report the loss whereas this one prevents it.
+    # Counted off the registry rather than off the loop counter above. `moved`
+    # counts attempts, so it would say everything went fine even if every call
+    # had quietly done nothing, which is exactly what a test of this check found.
+    on_survivor = len(er.async_entries_for_config_entry(entities, survivor.entry_id))
+    if on_survivor < expected:
+        _LOGGER.error(
+            "Refusing to merge %s: %d of its %d entities are still on their old "
+            "entries. No device has been touched and nothing has been removed, "
+            "so the entries are exactly as they were. Please report this",
+            address,
+            expected - on_survivor,
+            expected,
+        )
+        return
+
+    for entry in ordered:
+        subentry_id = subentry_for[entry.entry_id]
+        for device in list(dr.async_entries_for_config_entry(devices, entry.entry_id)):
+            devices.async_update_device(
+                device.id,
+                new_config_entry_id=survivor.entry_id,
+                new_config_subentry_id=subentry_id,
+            )
+
+    # The survivor must now own everything the group owned. This is cheap, and it
+    # is the difference between a silent catastrophe and a loud one: when the
+    # device and entity moves were the wrong way round in testing, Home Assistant
+    # deleted all 232 entities and the only visible sign was a success message
+    # claiming their ids were unchanged. Nothing is removed if this does not add
+    # up, so the old entries stay and the entities stay with them.
+    survived = len(er.async_entries_for_config_entry(entities, survivor.entry_id))
+    if survived < expected:
+        _LOGGER.error(
+            "Merging %s lost entities: it had %d and the merged entry has %d. "
+            "Home Assistant removes an entity when its device moves to an entry "
+            "that does not own it, so this is not something the integration can "
+            "undo. Nothing further will be removed, and the registry copies "
+            "taken before the merge are the way back. Please report this",
+            address,
+            expected,
+            survived,
+        )
+        return
+
+    removed = 0
+    removed_hosts = set()
+    for entry in ordered[1:]:
+        left = er.async_entries_for_config_entry(entities, entry.entry_id)
+        if left:
+            # Never remove an entry that still owns something: removing it would
+            # take those entities and their history with it.
+            _LOGGER.error(
+                "Not removing the Dahua entry for channel %d of %s: it still owns "
+                "%d entities, so the merge is incomplete and removing it would "
+                "delete them",
+                _channel_of(entry),
+                address,
+                len(left),
+            )
+            continue
+        await hass.config_entries.async_remove(entry.entry_id)
+        removed += 1
+        # The address as the removal hook spelled it, not the lowercased group
+        # key: normalize_address keeps the case, and the issue id is built from
+        # its own normalization. Deleting the lowercased id left a mixed-case
+        # host's card standing.
+        removed_hosts.add(normalize_address(entry.data.get(CONF_ADDRESS)))
+
+    for removed_host in removed_hosts:
+        # These removals are the merge's, not the user's, but each one runs the
+        # same removal hook a manual deletion does. That hook sees the surviving
+        # entry as a sibling and raises the "more Dahua entries still use
+        # <address>" card -- whose fix removes every entry at the address, which
+        # is the recorder this merge has just finished creating. Nothing is left
+        # to offer, so the card it just raised is withdrawn.
+        ir.async_delete_issue(hass, DOMAIN, ISSUE_SIBLINGS_REMAIN.format(removed_host))
+
+    _LOGGER.warning(
+        "%s is now one Dahua entry with %d channels: %d entities moved and %d "
+        "redundant entries removed, with all %d accounted for on the merged "
+        "entry. Entity ids are unchanged, so dashboards and automations keep "
+        "working",
+        # The subentries the survivor actually has, not the number of entries
+        # that were folded into them: two entries can share a channel, and
+        # counting entries would then claim a channel that does not exist.
+        address,
+        len(survivor.subentries),
+        moved,
+        removed,
+        survived,
+    )
+
+
+async def async_adopt_the_real_serial(hass: HomeAssistant, entry, coordinators) -> int:
+    """Adopt a reported serial while preserving entity IDs and device metadata.
+
+    Recognise legacy hashes in this entry's registries even if credentials
+    have since changed. Check every target for collisions before changing any
+    registry, copy all three persisted registries, then check again after the
+    backup yields. Conflicts and backup failures propagate so setup cannot
+    create duplicate entities under a partially migrated identity.
+
+    Entity unique IDs move before device identifiers and the config entry ID;
+    entity IDs and device IDs remain intact. Return the entity count.
+    """
+    old = None
+    for coordinator in coordinators:
+        client = getattr(coordinator, "client", None)
+        candidate = getattr(client, "credential_hash", None)
+        if candidate is None:
+            continue
+        old = candidate()
+        source = coordinator
+        break
+    if not old:
+        return 0
+
+    entities = er.async_get(hass)
+    devices = dr.async_get(hass)
+    entry_rows = er.async_entries_for_config_entry(entities, entry.entry_id)
+    entry_devices = dr.async_entries_for_config_entry(devices, entry.entry_id)
+    # The stored identity may predate a password change. The registries, not
+    # today's credentials, are authoritative about which legacy IDs need moving.
+    roots = {old}
+    for value in [
+        entry.unique_id,
+        *[v for d in entry_devices for domain, v in d.identifiers if domain == DOMAIN],
+        *[row.unique_id for row in entry_rows if row.platform == DOMAIN],
+    ]:
+        root = (value or "").split("_", 1)[0]
+        if is_synthesised_identity(root):
+            roots.add(root)
+
+    def is_legacy(value):
+        return any(
+            value == root or (value or "").startswith(root + "_") for root in roots
+        )
+
+    if not (
+        is_legacy(entry.unique_id)
+        or any(is_legacy(row.unique_id) for row in entry_rows)
+        or any(
+            domain == DOMAIN and is_legacy(value)
+            for device in entry_devices
+            for domain, value in device.identifiers
+        )
+    ):
+        return 0
+    serial = source.get_device_serial_number()
+    if not serial or serial in roots:
+        return 0
+
+    def replacement(value):
+        for root in roots:
+            if value == root or (value or "").startswith(root + "_"):
+                return serial + value[len(root) :]
+        return value
+
+    rows = [
+        (row, replacement(row.unique_id))
+        for row in entry_rows
+        if replacement(row.unique_id) != row.unique_id
+    ]
+    stale_devices = [
+        (
+            device,
+            {
+                (domain, replacement(value) if domain == DOMAIN else value)
+                for domain, value in device.identifiers
+            },
+        )
+        for device in entry_devices
+        if any(
+            domain == DOMAIN and replacement(value) != value
+            for domain, value in device.identifiers
+        )
+    ]
+    new_entry_id = replacement(entry.unique_id)
+    if not rows and not stale_devices and new_entry_id == entry.unique_id:
+        return 0
+
+    def preflight():
+        targets = set()
+        for row, target in rows:
+            key = (row.domain, row.platform, target)
+            held = entities.async_get_entity_id(*key)
+            if key in targets or (held is not None and held != row.entity_id):
+                raise ValueError("Serial migration entity conflict: " + row.entity_id)
+            targets.add(key)
+            current = entities.async_get(row.entity_id)
+            if current is None or current.unique_id != row.unique_id:
+                raise ValueError("Serial migration registry changed; retry setup")
+        device_targets = set()
+        for device, identifiers in stale_devices:
+            for identifier in identifiers:
+                if identifier[0] != DOMAIN:
+                    continue
+                held = devices.async_get_device(identifiers={identifier})
+                if identifier in device_targets or (
+                    held is not None and held.id != device.id
+                ):
+                    raise ValueError("Serial migration device conflict: " + device.id)
+                device_targets.add(identifier)
+            current = devices.async_get(device.id)
+            if current is None or current.identifiers != device.identifiers:
+                raise ValueError("Serial migration registry changed; retry setup")
+        if new_entry_id != entry.unique_id and any(
+            other.entry_id != entry.entry_id and other.unique_id == new_entry_id
+            for other in hass.config_entries.async_entries(DOMAIN)
+        ):
+            raise ValueError("Serial migration config entry conflict")
+
+    preflight()
+    backup = await hass.async_add_executor_job(_backup, hass, "pre-serial")
+    if backup is None:
+        raise ValueError(
+            "Could not back up all three registries before serial migration"
+        )
+    # Backup yields to other entry setups. Recheck every target afterwards;
+    # no await separates the checks from the registry mutations below.
+    preflight()
+    _LOGGER.warning(
+        "%s reports serial %s. Moving %d entities and %d devices; persisted "
+        "registry files were copied to %s first",
+        entry.data.get(CONF_ADDRESS),
+        serial,
+        len(rows),
+        len(stale_devices),
+        backup,
+    )
+    for row, target in rows:
+        entities.async_update_entity(row.entity_id, new_unique_id=target)
+    for device, identifiers in stale_devices:
+        devices.async_update_device(device.id, new_identifiers=identifiers)
+    if new_entry_id != entry.unique_id:
+        hass.config_entries.async_update_entry(entry, unique_id=new_entry_id)
+    return len(rows)

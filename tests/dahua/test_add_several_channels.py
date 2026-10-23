@@ -15,6 +15,7 @@ What matters here:
 - each extra channel becomes its own flow, carrying the same credentials and its
   own channel number
 """
+
 import asyncio
 from types import SimpleNamespace
 
@@ -34,6 +35,7 @@ from custom_components.dahua.const import (
     CONF_RTSP_PORT,
     CONF_USERNAME,
 )
+
 
 async def _noop(*args, **kwargs):
     return None
@@ -86,8 +88,7 @@ class _Client:
 
     async def async_get_config(self, name):
         return {
-            "table.ChannelTitle[{0}].Name".format(i): t
-            for i, t in self.titles.items()
+            "table.ChannelTitle[{0}].Name".format(i): t for i, t in self.titles.items()
         }
 
     async def async_probe_snapshot(self, channel_number):
@@ -113,6 +114,7 @@ async def _discover(monkeypatch, client, exclude=0):
 
 # --- discovery never breaks an ordinary setup -------------------------------
 
+
 async def test_a_camera_with_no_remote_device_table_offers_nothing(monkeypatch):
     """A standalone camera. Ordinary, not a failure."""
     client = _Client({}, [], remote_raises=RuntimeError("no such table"))
@@ -130,6 +132,7 @@ async def test_a_recorder_that_stops_answering_offers_nothing(monkeypatch):
 
 # --- what gets offered ------------------------------------------------------
 
+
 async def test_only_channels_that_answer_are_offered(monkeypatch):
     """The removed-camera case, and the reason this probes at all.
 
@@ -146,8 +149,7 @@ async def test_only_channels_that_answer_are_offered(monkeypatch):
 
 
 async def test_the_channel_being_added_is_not_offered_back(monkeypatch):
-    client = _Client(
-        slots={0: (True, "Private"), 1: (True, "Private")}, live=[0, 1])
+    client = _Client(slots={0: (True, "Private"), 1: (True, "Private")}, live=[0, 1])
 
     found = await _discover(monkeypatch, client, exclude=0)
 
@@ -155,8 +157,7 @@ async def test_the_channel_being_added_is_not_offered_back(monkeypatch):
 
 
 async def test_a_switched_off_slot_is_not_even_probed(monkeypatch):
-    client = _Client(
-        slots={0: (True, "Private"), 5: (False, "Private")}, live=[0, 5])
+    client = _Client(slots={0: (True, "Private"), 5: (False, "Private")}, live=[0, 5])
 
     await _discover(monkeypatch, client, exclude=0)
 
@@ -164,8 +165,7 @@ async def test_a_switched_off_slot_is_not_even_probed(monkeypatch):
 
 
 async def test_an_onvif_slot_is_not_even_probed(monkeypatch):
-    client = _Client(
-        slots={0: (True, "Private"), 3: (True, "Onvif")}, live=[0, 3])
+    client = _Client(slots={0: (True, "Private"), 3: (True, "Onvif")}, live=[0, 3])
 
     await _discover(monkeypatch, client, exclude=0)
 
@@ -174,8 +174,10 @@ async def test_an_onvif_slot_is_not_even_probed(monkeypatch):
 
 async def test_the_recorders_own_name_is_used_as_the_label(monkeypatch):
     client = _Client(
-        slots={0: (True, "Private"), 1: (True, "Private")}, live=[0, 1],
-        titles={1: "BACKYARD"})
+        slots={0: (True, "Private"), 1: (True, "Private")},
+        live=[0, 1],
+        titles={1: "BACKYARD"},
+    )
 
     found = await _discover(monkeypatch, client, exclude=0)
 
@@ -183,8 +185,7 @@ async def test_the_recorders_own_name_is_used_as_the_label(monkeypatch):
 
 
 async def test_a_channel_with_no_title_still_gets_a_label(monkeypatch):
-    client = _Client(
-        slots={0: (True, "Private"), 1: (True, "Private")}, live=[0, 1])
+    client = _Client(slots={0: (True, "Private"), 1: (True, "Private")}, live=[0, 1])
 
     found = await _discover(monkeypatch, client, exclude=0)
 
@@ -192,6 +193,7 @@ async def test_a_channel_with_no_title_still_gets_a_label(monkeypatch):
 
 
 # --- the step, and what it queues -------------------------------------------
+
 
 async def test_choosing_channels_records_them_and_moves_on():
     """It goes on to the areas step now, not straight to naming.
@@ -235,6 +237,7 @@ async def test_choosing_channels_still_reaches_naming_through_the_areas_step():
 async def test_choosing_none_queues_nothing():
     flow = _flow()
     flow._found_channels = {1: "BACKYARD"}
+
     async def show(data):
         return None
 
@@ -247,8 +250,10 @@ async def test_choosing_none_queues_nothing():
 
 # --- taking the lot in one click ---------------------------------------------
 
+
 async def _chose(flow, user_input):
     """Run the step with `user_input` and return what it recorded."""
+
     async def show(data):
         return None
 
@@ -279,8 +284,7 @@ async def test_all_channels_wins_over_the_ticked_list():
     flow = _flow()
     flow._found_channels = {1: "ONE", 2: "TWO", 3: "THREE"}
 
-    chosen = await _chose(
-        flow, {CONF_ALL_CHANNELS: True, CONF_EXTRA_CHANNELS: ["2"]})
+    chosen = await _chose(flow, {CONF_ALL_CHANNELS: True, CONF_EXTRA_CHANNELS: ["2"]})
 
     assert chosen == [1, 2, 3]
 
@@ -290,8 +294,7 @@ async def test_leaving_it_off_still_honours_the_ticked_list():
     flow = _flow()
     flow._found_channels = {1: "ONE", 2: "TWO", 3: "THREE"}
 
-    chosen = await _chose(
-        flow, {CONF_ALL_CHANNELS: False, CONF_EXTRA_CHANNELS: ["3"]})
+    chosen = await _chose(flow, {CONF_ALL_CHANNELS: False, CONF_EXTRA_CHANNELS: ["3"]})
 
     assert chosen == [3]
 
@@ -306,14 +309,62 @@ async def test_all_channels_with_nothing_found_chooses_nothing():
 
 
 async def test_the_form_says_how_many_were_found():
-    """The count is in the label and the description, so it has to be given."""
+    """The count is in the label and the description, so it has to be given.
+
+    Asserted on the count rather than on the whole dict, which is what this
+    used to do. An exact dict here says two things at once -- "the count is
+    right" and "nothing else is passed" -- and it was the second that failed
+    when the form gained a sentence naming the channels skipped for ONVIF.
+    Being told the count is wrong because a different key was added is the
+    kind of failure that gets fixed by editing the expectation.
+
+    The second claim is better made elsewhere and now is:
+    test_config_step_placeholders.py checks the placeholders the steps name
+    against the ones the flow passes, in both directions, which is the thing
+    an exact dict was standing in for.
+    """
     flow = _flow()
     flow._found_channels = {1: "ONE", 4: "FOUR"}
     flow._errors = {}
 
     result = await flow.async_step_channels()
 
-    assert result["description_placeholders"] == {"count": "2"}
+    assert result["description_placeholders"]["count"] == "2"
+
+
+async def test_an_onvif_channel_is_named_rather_than_just_missing():
+    """#577: the reporter counted six channels, was offered four, and had to
+    find a generic sentence about channels that "are not listed" to work out
+    why. The one on ONVIF is named now, by the number the recorder shows."""
+    flow = _flow()
+    flow._found_channels = {1: "ONE"}
+    flow._onvif_channels = [5]
+    flow._errors = {}
+
+    result = await flow.async_step_channels()
+
+    note = result["description_placeholders"]["skipped_note"]
+    assert "Channel 6" in note, "named by recorder channel number, not index"
+    assert "ONVIF" in note
+    # And says what the user can still do. The first version of this note said
+    # the integration "cannot drive" the channel, which contradicts #710: that
+    # PR warns at setup and deliberately still creates the camera entity, and
+    # @JimGermany reports the stream working through his recorder for such a
+    # channel. Telling somebody a thing is impossible when the integration
+    # allows it is the worse error of the two.
+    assert "by hand" in note, "the note must not imply the channel is unusable"
+
+
+async def test_nothing_skipped_means_no_sentence():
+    """A whole sentence or nothing, the rule the repair cards follow."""
+    flow = _flow()
+    flow._found_channels = {1: "ONE"}
+    flow._onvif_channels = []
+    flow._errors = {}
+
+    result = await flow.async_step_channels()
+
+    assert result["description_placeholders"]["skipped_note"] == ""
 
 
 async def test_the_form_offers_the_switch_and_the_list():
@@ -324,27 +375,28 @@ async def test_the_form_offers_the_switch_and_the_list():
     result = await flow.async_step_channels()
 
     keys = [str(key) for key in result["data_schema"].schema]
-    assert keys == [CONF_ALL_CHANNELS, CONF_EXTRA_CHANNELS], (
-        "the switch is offered first, above the boxes it replaces")
+    assert keys == [
+        CONF_ALL_CHANNELS,
+        CONF_EXTRA_CHANNELS,
+    ], "the switch is offered first, above the boxes it replaces"
 
 
-def test_each_extra_channel_becomes_its_own_flow():
+def test_each_extra_channel_becomes_its_own_subentry():
+    """This used to start a config flow per extra channel, so sixteen channels
+    became sixteen config entries. #827 makes them subentries of one entry."""
     flow = _flow()
     flow._found_channels = {1: "BACKYARD", 2: "DRIVEWAY"}
     flow._extra_channels = [1, 2]
-    started = []
-    flow.hass = SimpleNamespace(
-        async_create_task=lambda coro: None,
-        config_entries=SimpleNamespace(flow=SimpleNamespace(
-            async_init=lambda domain, context=None, data=None: started.append(data))),
-    )
 
-    flow._queue_extra_channels()
+    extras = [
+        s["data"] for s in flow._channel_subentries() if s["data"][CONF_CHANNEL] != 0
+    ]
 
-    assert [d[CONF_CHANNEL] for d in started] == [1, 2]
-    assert [d[CONF_NAME] for d in started] == ["BACKYARD", "DRIVEWAY"]
-    assert all(d[CONF_PASSWORD] == "pw" for d in started), \
-        "each flow needs the credentials the user already gave"
+    assert [d[CONF_CHANNEL] for d in extras] == [1, 2]
+    assert [d[CONF_NAME] for d in extras] == ["BACKYARD", "DRIVEWAY"]
+    assert all(
+        d[CONF_PASSWORD] == "pw" for d in extras
+    ), "each channel needs the credentials the user already gave"
 
 
 def test_queueing_does_not_mutate_the_first_entrys_data():
@@ -356,34 +408,31 @@ def test_queueing_does_not_mutate_the_first_entrys_data():
     flow = _flow()
     flow._found_channels = {1: "BACKYARD"}
     flow._extra_channels = [1]
-    flow.hass = SimpleNamespace(
-        async_create_task=lambda coro: None,
-        config_entries=SimpleNamespace(flow=SimpleNamespace(
-            async_init=lambda domain, context=None, data=None: None)),
-    )
 
-    flow._queue_extra_channels()
+    flow._channel_subentries()
 
     assert flow.init_info[CONF_CHANNEL] == 0
     assert flow.init_info[CONF_NAME] == "Front"
 
 
-def test_nothing_chosen_starts_no_flows():
+def test_nothing_chosen_makes_no_subentries():
+    """A single camera is a camera, not a hub with one member.
+
+    It used to get one subentry for the primary, on the reasoning that setup reads
+    channels from the subentries whenever there are any. That reasoning holds for
+    a recorder and not for one camera: with no subentries at all,
+    `channel_configs()` takes its single-channel branch on the entry's own data.
+    What the subentry bought was Home Assistant nesting the camera's device
+    underneath it, which read as a recorder with one channel (#830).
+    """
     flow = _flow()
     flow._extra_channels = []
-    started = []
-    flow.hass = SimpleNamespace(
-        async_create_task=lambda coro: started.append(coro),
-        config_entries=SimpleNamespace(flow=SimpleNamespace(
-            async_init=lambda **kw: None)),
-    )
 
-    flow._queue_extra_channels()
-
-    assert started == []
+    assert flow._channel_subentries() == []
 
 
 # --- the step that actually creates the extra entries ------------------------
+
 
 async def test_an_imported_channel_becomes_an_entry():
     flow = DahuaFlowHandler()
@@ -402,15 +451,17 @@ async def test_an_imported_channel_becomes_an_entry():
     # address just confirmed. That reads the entry list through hass, which this
     # test does not have, so it is stubbed like the other Home Assistant calls.
     flow._async_current_entries = lambda: []
-    flow.async_create_entry = lambda title, data: created.update(
-        {"title": title, "data": data}) or created
+    flow.async_create_entry = (
+        lambda title, data: created.update({"title": title, "data": data}) or created
+    )
 
     await flow.async_step_import(_entry_data(channel=3))
 
     assert created["title"] == "Front"
     assert created["data"][CONF_CHANNEL] == 3
-    assert created["unique_id"] == "SER1_3", \
-        "a channel above zero has to be distinguishable from the device itself"
+    assert (
+        created["unique_id"] == "SER1_3"
+    ), "a channel above zero has to be distinguishable from the device itself"
 
 
 async def test_an_imported_channel_that_no_longer_answers_aborts():
@@ -430,11 +481,13 @@ async def test_an_imported_channel_that_no_longer_answers_aborts():
 
     await flow.async_step_import(_entry_data(channel=3))
 
-    assert aborted["reason"] == "channel_not_added", (
-        "it used to abort with an *error* key, which config.abort had no string for")
+    assert (
+        aborted["reason"] == "channel_not_added"
+    ), "it used to abort with an *error* key, which config.abort had no string for"
 
 
 # --- the routing, and the wait the user is shown --------------------------
+
 
 def _routable(found):
     """A flow sitting at the point where the search has already finished."""
@@ -457,7 +510,8 @@ async def test_the_search_is_shown_as_a_wait():
 
     flow = DahuaFlowHandler()
     flow.hass = SimpleNamespace(
-        async_create_task=lambda coro: asyncio.ensure_future(coro))
+        async_create_task=lambda coro: asyncio.ensure_future(coro)
+    )
 
     async def credentials(*args, **kwargs):
         return {"name": "Front", "serialNumber": "SER1"}, None
@@ -479,7 +533,8 @@ async def test_the_search_is_shown_as_a_wait():
     assert result["type"] == FlowResultType.SHOW_PROGRESS
     assert result["step_id"] == "discover"
     assert result["description_placeholders"]["seconds"] == str(
-        flow_module.DISCOVERY_TIMEOUT_SECONDS)
+        flow_module.DISCOVERY_TIMEOUT_SECONDS
+    )
     await flow._discovery_task
 
 
@@ -562,32 +617,130 @@ async def test_a_recorder_that_probes_forever_gives_up(monkeypatch):
             await asyncio.sleep(30)
 
     monkeypatch.setattr(flow_module, "DISCOVERY_TIMEOUT_SECONDS", 0.1)
-    client = _Slow(
-        slots={0: (True, "Private"), 1: (True, "Private")}, live=[0, 1])
+    client = _Slow(slots={0: (True, "Private"), 1: (True, "Private")}, live=[0, 1])
 
     found = await _discover(monkeypatch, client, exclude=0)
 
     assert found == {}, "a hung recorder must not hold the form open"
 
 
-async def test_creating_the_first_entry_starts_the_others():
+async def test_creating_the_entry_carries_every_channel():
     """The join at the other end.
 
-    _queue_extra_channels is tested directly above and nothing tested that
-    anything calls it. Dropping the call leaves every other test here green
-    and the feature doing nothing at all.
+    _channel_subentries is tested directly above and nothing tested that
+    anything calls it. Dropping the argument leaves every other test here green
+    and the feature quietly creating a single channel.
     """
     flow = _flow()
     flow._found_channels = {1: "BACKYARD"}
     flow._extra_channels = [1]
-    started = []
-    flow.hass = SimpleNamespace(
-        async_create_task=lambda coro: None,
-        config_entries=SimpleNamespace(flow=SimpleNamespace(
-            async_init=lambda domain, context=None, data=None: started.append(data))),
+    passed = {}
+    flow.async_create_entry = lambda title, data, subentries=None: passed.update(
+        subentries=subentries
     )
-    flow.async_create_entry = lambda title, data: None
 
     await flow.async_step_name({"name": "Front Door"})
 
-    assert [d[CONF_CHANNEL] for d in started] == [1]
+    assert (
+        passed["subentries"] is not None
+    ), "the channels were never handed to async_create_entry"
+    assert [s["data"][CONF_CHANNEL] for s in passed["subentries"]] == [0, 1]
+
+
+# --- the ceiling the dialog advertises (#1000) ------------------------------
+
+
+async def _bounded(monkeypatch, client, budget=0.2):
+    """Run the bounded search against `client`, with the network stubbed."""
+    import custom_components.dahua.config_flow as flow_module
+
+    class _Session:
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(flow_module, "ClientSession", lambda **kw: _Session())
+    monkeypatch.setattr(flow_module, "TCPConnector", lambda **kw: None)
+    monkeypatch.setattr(flow_module, "DahuaClient", lambda *a, **kw: client)
+    monkeypatch.setattr(flow_module, "DISCOVERY_TIMEOUT_SECONDS", budget)
+
+    flow = _flow()
+    started = asyncio.get_running_loop().time()
+    found = await flow._async_discover_channels(_entry_data(), 0)
+    return found, asyncio.get_running_loop().time() - started
+
+
+class _SlowSlotTable(_Client):
+    """A device that accepts the read and does not answer it.
+
+    This is the half the old ceiling did not cover. It was around the snapshot
+    probes only, so the slot table and the titles could spend TIMEOUT_SECONDS
+    each before the ceiling applied to anything -- 20, 20 and 30, while the
+    dialog said 30.
+    """
+
+    def __init__(self, delay):
+        super().__init__({}, [])
+        self.delay = delay
+
+    async def async_get_remote_devices(self):
+        await asyncio.sleep(self.delay)
+        return {}
+
+
+async def test_a_slot_table_that_never_answers_is_inside_the_ceiling(monkeypatch):
+    """#1000's shape: the step sat past the number on screen with no way to
+    tell a slow search from a frozen one."""
+    found, took = await _bounded(monkeypatch, _SlowSlotTable(delay=5), budget=0.2)
+
+    assert found == {}
+    assert took < 2, "the search ran for %.1fs on a 0.2s budget" % took
+
+
+async def test_an_expired_search_offers_nothing_rather_than_failing(monkeypatch):
+    """Expiry is an ordinary outcome. The camera the user asked for is still
+    added -- not offering extras is a fine answer, and a failed setup is not."""
+    found, _ = await _bounded(monkeypatch, _SlowSlotTable(delay=5), budget=0.1)
+
+    assert found == {}
+
+
+async def test_a_search_that_finishes_in_time_still_offers_what_it_found(
+    monkeypatch,
+):
+    """The ceiling must not cost the feature it protects."""
+    # (enabled, protocol) per slot index, which is the shape _Client reads.
+    client = _Client({1: (True, "Dahua")}, live=[1])
+
+    found, _ = await _bounded(monkeypatch, client, budget=5)
+
+    assert found == {1: "Channel 2"}
+
+
+async def test_the_step_moves_on_after_the_search_expires(monkeypatch):
+    """What the user sees: the dialog ends and the naming step arrives, rather
+    than the progress step being shown again for ever."""
+    import custom_components.dahua.config_flow as flow_module
+
+    flow = _flow()
+    flow.hass = SimpleNamespace(
+        async_create_task=lambda coro: asyncio.ensure_future(coro)
+    )
+    monkeypatch.setattr(flow_module, "DISCOVERY_TIMEOUT_SECONDS", 0.1)
+
+    async def never_answers(user_input, exclude):
+        await asyncio.sleep(5)
+        return {"unreachable": "never"}
+
+    # The inner search, so the ceiling around it is still in the path.
+    # Patching _async_discover_channels would replace the ceiling itself and
+    # this test would hang instead of failing.
+    flow._async_search_channels = never_answers
+
+    first = await flow.async_step_discover()
+    assert first["type"] == FlowResultType.SHOW_PROGRESS
+
+    await flow._discovery_task
+    second = await flow.async_step_discover()
+
+    assert second["type"] == FlowResultType.SHOW_PROGRESS_DONE
+    assert second["step_id"] == "name", "an expired search must not offer channels"

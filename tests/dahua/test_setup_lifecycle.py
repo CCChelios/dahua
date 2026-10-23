@@ -73,7 +73,9 @@ def _working():
 
 def _no_platforms(hass):
     return (
-        patch.object(dahua_module.DahuaDataUpdateCoordinator, "async_start_event_listener"),
+        patch.object(
+            dahua_module.DahuaDataUpdateCoordinator, "async_start_event_listener"
+        ),
         patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
         patch.object(
             hass.config_entries, "async_unload_platforms", AsyncMock(return_value=True)
@@ -104,6 +106,7 @@ async def _try_setup(hass, entry):
 
 
 # --- the failed setup -------------------------------------------------------
+
 
 async def test_a_failed_setup_gives_the_connector_back(hass):
     entry = _entry(hass)
@@ -194,10 +197,13 @@ async def test_a_failed_setup_is_not_published_to_hass_data(hass):
     with _wedged(), starts, forward, unload:
         await _try_setup(hass, entry)
 
-    assert entry.entry_id not in hass.data.get(DOMAIN, {})
+    # Home Assistant deletes runtime_data when an entry unloads, so the
+    # absence of the attribute is what "unloaded" looks like now.
+    assert not hasattr(entry, "runtime_data")
 
 
 # --- the successful setup, unchanged ---------------------------------------
+
 
 async def test_a_successful_setup_holds_its_reference(hass):
     entry = _entry(hass)
@@ -222,7 +228,10 @@ async def test_unloading_gives_it_back(hass):
 
 # --- the update listener ----------------------------------------------------
 
-async def test_reloading_does_not_leave_a_listener_behind(hass, enable_custom_integrations):
+
+async def test_reloading_does_not_leave_a_listener_behind(
+    hass, enable_custom_integrations
+):
     """An entry's update listeners are not cleared on unload, so an unwrapped
     add_update_listener leaves one on every reload -- and then one options
     change fires as many reloads as the entry has ever had.
@@ -240,9 +249,11 @@ async def test_reloading_does_not_leave_a_listener_behind(hass, enable_custom_in
             assert await hass.config_entries.async_unload(entry.entry_id)
             await hass.async_block_till_done()
 
-    assert len(entry.update_listeners) <= 1, (
-        "%d listeners registered: one options change would fire %d reloads"
-        % (len(entry.update_listeners), len(entry.update_listeners))
+    assert (
+        len(entry.update_listeners) <= 1
+    ), "%d listeners registered: one options change would fire %d reloads" % (
+        len(entry.update_listeners),
+        len(entry.update_listeners),
     )
 
 
@@ -268,6 +279,7 @@ async def test_a_failed_setup_registers_no_listener_at_all(hass):
 
 
 # --- how the platforms get forwarded ----------------------------------------
+
 
 async def test_every_platform_is_forwarded_in_a_single_call(hass):
     """One call per platform serialises setup.
@@ -305,3 +317,38 @@ async def test_a_platform_switched_off_is_not_forwarded(hass):
     assert "select" not in forwarded_platforms
     assert "light" not in forwarded_platforms
     assert "camera" in forwarded_platforms, "the others must still load"
+
+
+async def test_serial_migration_failure_stops_platforms_and_releases_sessions(hass):
+    entry = _entry(hass)
+    starts, forward, unload = _no_platforms(hass)
+    with _working(), starts, forward as forward_mock, unload, patch(
+        "custom_components.dahua.migrate.async_adopt_the_real_serial",
+        side_effect=ValueError("registry migration failed"),
+    ):
+        _setting_up(hass, entry)
+        with pytest.raises(ConfigEntryNotReady):
+            await dahua_module.async_setup_entry(hass, entry)
+        forward_mock.assert_not_called()
+    assert _refcount() == 0
+    assert not hasattr(entry, "runtime_data")
+
+
+async def test_reported_serial_policy_survives_monitor_reload(hass):
+    entry = _entry(hass)
+    starts, forward, unload = _no_platforms(hass)
+
+    async def refresh(coordinator):
+        coordinator._serial_number = "MONITOR-SERIAL"
+        coordinator.client._vth_identity = {"class": "VTH", "serial": "MONITOR-SERIAL"}
+        return {"serialNumber": "MONITOR-SERIAL"}
+
+    with patch.object(
+        dahua_module.DahuaDataUpdateCoordinator, "_async_update_data", refresh
+    ), starts, forward, unload:
+        assert await _try_setup(hass, entry)
+        assert entry.data["require_reported_serial"] is True
+        await dahua_module.async_unload_entry(hass, entry)
+        assert await _try_setup(hass, entry)
+        assert entry.runtime_data[0].client._require_reported_serial is True
+        await dahua_module.async_unload_entry(hass, entry)

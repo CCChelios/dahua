@@ -15,10 +15,12 @@ Not having the first, per model, is what the model-name matching in #570, #676
 and #690 exists to work around, and it cannot be collected while it is
 discarded at the point it is produced.
 """
+
 from aiohttp import ClientConnectionError, ClientResponseError
 
 from custom_components.dahua import DahuaDataUpdateCoordinator
 from custom_components.dahua.diagnostics import _capabilities_block
+from custom_components.dahua.rpc2 import Rpc2MethodRefused
 
 
 def _coordinator():
@@ -33,13 +35,16 @@ def _status(code):
 
 # --- the device answered ----------------------------------------------------
 
+
 def test_a_status_is_recorded_as_an_answer():
     c = _coordinator()
 
     c._note_probe_refusal("lighting_scheme", _status(400))
 
     assert c._probe_refusals["lighting_scheme"] == {
-        "answered": True, "status": 400, "error": "ClientResponseError",
+        "answered": True,
+        "status": 400,
+        "error": "ClientResponseError",
     }
 
 
@@ -53,7 +58,27 @@ def test_a_404_is_an_answer_too():
     assert c._probe_refusals["ptz_position"]["status"] == 404
 
 
+def test_an_rpc2_refusal_is_an_answer_too():
+    """An RPC2 refusal carries a code rather than an HTTP status, and it is the
+    device answering: this firmware does not serve that method or table."""
+    c = _coordinator()
+
+    c._note_probe_refusal(
+        "cloud_upgrade",
+        Rpc2MethodRefused(
+            "Dahua RPC2 method configManager.getConfig returned result=false",
+            code=268959743,
+            message="Unknown error",
+        ),
+    )
+
+    refusal = c._probe_refusals["cloud_upgrade"]
+    assert refusal["answered"] is True
+    assert refusal["status"] == 268959743
+
+
 # --- the device did not answer ----------------------------------------------
+
 
 def test_a_timeout_is_not_an_answer():
     c = _coordinator()
@@ -81,11 +106,14 @@ def test_the_two_are_distinguishable():
     c._note_probe_refusal("refused", _status(400))
     c._note_probe_refusal("silent", TimeoutError())
 
-    assert c._probe_refusals["refused"]["answered"] != \
-        c._probe_refusals["silent"]["answered"]
+    assert (
+        c._probe_refusals["refused"]["answered"]
+        != c._probe_refusals["silent"]["answered"]
+    )
 
 
 # --- more than one ----------------------------------------------------------
+
 
 def test_each_probe_is_recorded_separately():
     c = _coordinator()
@@ -108,6 +136,7 @@ def test_a_later_result_replaces_the_earlier_one():
 
 # --- it reaches diagnostics -------------------------------------------------
 
+
 def test_diagnostics_reports_them():
     c = _coordinator()
     c._supports_lighting_v2 = False
@@ -116,8 +145,9 @@ def test_diagnostics_reports_them():
     block = _capabilities_block(c)
 
     assert block["refusals"]["lighting_v2"]["status"] == 400
-    assert block["probed"]["lighting_v2"] is False, \
-        "the capability and the reason should both be there"
+    assert (
+        block["probed"]["lighting_v2"] is False
+    ), "the capability and the reason should both be there"
 
 
 def test_a_device_that_refused_nothing_reports_nothing():
